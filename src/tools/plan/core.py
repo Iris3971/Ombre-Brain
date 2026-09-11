@@ -91,6 +91,85 @@ def _window_instant(value: object) -> str | None:
         return raw
 
 
+def _as_utc_instant(value: object) -> "datetime | None":
+    """把窗口边界或某个时刻解析为 aware UTC datetime（解析失败返回 None）。
+
+    复用 `_window_instant` 的同一套解析 / 时区补全 / UTC 归一化规则——**不另立
+    第二套时间逻辑**，只是落到 datetime 上做比较。之所以不直接拿 `_window_instant`
+    的 ISO 字符串做字典序比较：`now` 若无微秒（`...00+00:00`）而 `window_end`
+    带 `.999999`，字符串里 `+`(0x2B) 会排在 `.`(0x2E) 之前，导致 `end` 被误判成
+    小于一个其实更早的 `now`。落到 datetime 上比较则没有这个坑。
+    """
+    iso = _window_instant(value)
+    if not iso:
+        return None
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _coerce_now_utc(now: object) -> datetime:
+    """把调用方传入的 `now` 归一化为 aware UTC datetime。
+
+    **`now` 是一个时间点，不是日历日期**——所以它的时区语义与窗口边界
+    （`_as_utc_instant` / `_window_instant`，date-only/naive 按项目配置时区）**不同**：
+
+    - aware datetime：按其自身偏移换算到 UTC。
+    - naive datetime：**明确按 UTC 解释**（`tzinfo=timezone.utc`），**不**用项目配置
+      时区做本地补全。这样调用方传 `datetime.utcnow()`（naive-UTC）不会被偏移。
+    - None / 非 datetime：调用方违反契约，`raise TypeError`（fail fast，绝不静默）。
+    """
+    if not isinstance(now, datetime):
+        raise TypeError(
+            "is_window_open() 的 now 必须是 datetime；naive 按 UTC 解释"
+        )
+    if now.tzinfo is None or now.utcoffset() is None:
+        return now.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc)
+
+
+def is_window_open(meta: dict, now: datetime) -> bool:
+    """一个 Plan 在 `now` 时刻是否具备「window resurfacing eligibility」。
+
+    仅当同时满足：`status == "active"`、至少存在一个 window 边界、且 `now` 落在
+    有效窗口内，才返回 True：
+
+    - 双边窗口：``window_start <= now <= window_end``
+    - 仅 ``window_start``：``now >= window_start``
+    - 仅 ``window_end``：``now <= window_end``
+    - 两个边界都不存在：``False`` —— 无窗口的历史 active Plan 不因未来 Phase 3
+      接入而凭空获得普通 breath resurfacing 资格。实现的是「window Plan
+      eligibility」，不是「所有 active Plan eligibility」。
+    - ``status`` 非 active（resolved / abandoned / 缺失）：``False``
+
+    **`now` 契约**（见 `_coerce_now_utc`）：aware 按自身偏移转 UTC；naive **明确按
+    UTC** 解释（不本地补全）；None / 非 datetime 抛 `TypeError`（fail fast，不静默
+    返回 False）。**窗口边界**仍按 Phase 1 语义（`_as_utc_instant`：date-only/naive
+    按项目配置时区），malformed 存储值 fail-closed 视为该边界不存在。`now` 由调用方
+    显式传入，本函数不读系统时钟。
+    """
+    now_utc = _coerce_now_utc(now)  # 先验证 now：契约违背 fail fast，早于任何 False 分支
+
+    meta = meta or {}
+    if str(meta.get("status") or "").strip().lower() != "active":
+        return False
+
+    start = _as_utc_instant(meta.get("window_start"))
+    end = _as_utc_instant(meta.get("window_end"))
+    if start is None and end is None:
+        return False
+
+    if start is not None and now_utc < start:
+        return False
+    if end is not None and now_utc > end:
+        return False
+    return True
+
+
 
 
 def normalize_unlock_date(lock_type: str, value: object, *, now: datetime | None = None) -> str | None:
