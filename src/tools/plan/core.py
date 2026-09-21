@@ -170,6 +170,49 @@ def is_window_open(meta: dict, now: datetime) -> bool:
     return True
 
 
+def collect_resurfaced_plans(buckets: list, shown_ids, now: datetime) -> list:
+    """从 buckets 里选出本轮应 resurface 的 plan（Phase 3 纯筛选，只读）。
+
+    全部满足才入选：
+    - `type == "plan"` 且 `status == "active"`；
+    - `related_bucket`（单个 id）落在 `shown_ids` 内；
+    - `is_window_open(meta, now)` 为真（当前落在时间窗内）。
+
+    返回按 `created` 倒序（新→旧）、按 plan id 去重后的 plan 桶列表。
+
+    纯只读：不渲染、不碰 token budget、不改任何桶。related_bucket 保持单值
+    （多值属 FUTURE）。`shown_ids` 的口径——只含本轮真正渲染成功的 ordinary
+    dynamic 候选——由调用方（surface_default）负责，本函数不关心其来源，也不
+    读系统时钟（`now` 显式传入，交给 is_window_open 校验）。
+    """
+    shown = set(shown_ids or ())
+    if not shown:
+        return []
+    seen: set = set()
+    picked: list = []
+    for b in buckets:
+        meta = b.get("metadata") or {}
+        if meta.get("type") != "plan":
+            continue
+        if str(meta.get("status") or "").strip().lower() != "active":
+            continue
+        related = str(meta.get("related_bucket") or "").strip()
+        if not related or related not in shown:
+            continue
+        if not is_window_open(meta, now):
+            continue
+        pid = b.get("id")
+        if pid in seen:
+            continue
+        seen.add(pid)
+        picked.append(b)
+    picked.sort(
+        key=lambda x: (x.get("metadata") or {}).get("created", ""),
+        reverse=True,
+    )
+    return picked
+
+
 
 
 def normalize_unlock_date(lock_type: str, value: object, *, now: datetime | None = None) -> str | None:
