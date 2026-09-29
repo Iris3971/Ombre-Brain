@@ -20,6 +20,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from ombrebrain.domain.memory_messages import resolved_hint
+from tools.i import disputing_candidates, superseded_by
 from . import _shared as sh
 
 logger = sh.logger
@@ -475,7 +476,14 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}/archive", methods=["POST"])
     async def api_bucket_archive(request: Request) -> Response:
-        """Submit a human deletion request before archiving a formal bucket."""
+        """Submit the single human archive request for a formal bucket.
+
+        Human-facing archive intentionally uses the delete-to-archive terminal
+        action: after AI approval the Markdown is retained in ``archive/`` and
+        receives ``deleted_at``. The lower-level ``bucket_mgr.archive()`` path
+        remains available to AI/system lifecycle code and keeps its distinct
+        non-tombstone semantics.
+        """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
@@ -487,7 +495,7 @@ def register(mcp) -> None:
             except Exception:
                 body = {}
             result = await sh.deletion_requests.submit(
-                bucket_id, body.get("reason", ""), action="archive"
+                bucket_id, body.get("reason", ""), action="delete"
             )
             if result.get("ok"):
                 return JSONResponse(result)
@@ -601,7 +609,7 @@ def register(mcp) -> None:
             return JSONResponse({"error": "unsupported batch action"}, status_code=400)
         if action == "archive":
             result = await sh.deletion_requests.submit_batch(
-                list(dict.fromkeys(ids)), body.get("reason", ""), action="archive"
+                list(dict.fromkeys(ids)), body.get("reason", ""), action="delete"
             )
             status = 400 if result.get("code") == "reason_required" else 200
             return JSONResponse({"action": action, **result}, status_code=status)
@@ -1041,6 +1049,10 @@ def register(mcp) -> None:
                 )
             ]
             self_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            # 被取代的和正在被质疑的必须标出来，否则人在 Dashboard 上看到的是
+            # 一堆并列的「我认为」，中间夹着几条模型早就不这么想了的——
+            # 而人恰恰是最该看到「这条被替换了」的那个。
+            buckets_by_id = {b["id"]: b for b in all_b}
             result = []
             for b in self_buckets:
                 meta = b["metadata"]
@@ -1051,6 +1063,9 @@ def register(mcp) -> None:
                     "content": b.get("content", ""),
                     "aspect": aspect,
                     "created": meta.get("created", ""),
+                    "superseded_by": superseded_by(b),
+                    "disputed_by": disputing_candidates(b, buckets_by_id),
+                    "sedimented": bool(meta.get("i_from_candidate")),
                 })
             return JSONResponse(result)
         except Exception as e:

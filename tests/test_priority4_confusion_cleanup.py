@@ -331,7 +331,8 @@ def test_dashboard_single_bucket_delete_is_not_labeled_as_hard_delete():
     for rel in ("frontend/dashboard.html",):
         text = (ROOT / rel).read_text(encoding="utf-8")
 
-        assert "删除到档案" in text
+        assert "归档" in text
+        assert "bucketDelete(this.dataset.bucketId)" not in text
         assert "这将彻底删除此记忆桶" not in text
         assert "你真的要永久删除吗" not in text
         assert "彻底删除这封信" not in text
@@ -490,13 +491,18 @@ async def test_dashboard_hot_config_persist_failure_rolls_back_runtime(
 ):
     runtime = {
         "transport": "streamable-http",
-        "dehydration": {"model": "old-model", "max_tokens": 1000},
+        "dehydration": {
+            "model": "old-model",
+            "max_tokens": 1000,
+            "import_max_tokens": 4096,
+        },
         "merge_threshold": 70,
     }
     dehydrator = SimpleNamespace(
         model="old-model",
         base_url="https://old.example/v1",
         max_tokens=1000,
+        import_max_tokens=4096,
         temperature=0.2,
         timeout_seconds=30.0,
         api_format="openai_compat",
@@ -517,7 +523,11 @@ async def test_dashboard_hot_config_persist_failure_rolls_back_runtime(
     config_api.register(mcp)
 
     response = await mcp.routes[("POST", "/api/config")](JsonRequest({
-        "dehydration": {"model": "new-model", "max_tokens": 2000},
+        "dehydration": {
+            "model": "new-model",
+            "max_tokens": 2000,
+            "import_max_tokens": 6144,
+        },
         "merge_threshold": 55,
         "persist": True,
     }))
@@ -526,11 +536,182 @@ async def test_dashboard_hot_config_persist_failure_rolls_back_runtime(
     assert _json(response)["updated"] == []
     assert runtime == {
         "transport": "streamable-http",
-        "dehydration": {"model": "old-model", "max_tokens": 1000},
+        "dehydration": {
+            "model": "old-model",
+            "max_tokens": 1000,
+            "import_max_tokens": 4096,
+        },
         "merge_threshold": 70,
     }
     assert dehydrator.model == "old-model"
     assert dehydrator.max_tokens == 1000
+    assert dehydrator.import_max_tokens == 4096
+
+
+@pytest.mark.parametrize("configured", [32768, 9_007_199_254_740_991])
+@pytest.mark.asyncio
+async def test_dashboard_import_budget_reads_persists_and_hot_reloads(
+    monkeypatch, configured
+):
+    runtime = {
+        "dehydration": {
+            "model": "model",
+            "max_tokens": 1024,
+            "digest_max_tokens": 16384,
+            "import_max_tokens": configured,
+        }
+    }
+    persisted = copy.deepcopy(runtime)
+    dehydrator = SimpleNamespace(
+        model="model",
+        base_url="https://example.invalid/v1",
+        max_tokens=1024,
+        digest_max_tokens=16384,
+        import_max_tokens=configured,
+        temperature=0.1,
+        timeout_seconds=60.0,
+        api_format="openai_compat",
+        extra_body={},
+        api_key="",
+        api_available=False,
+        client=None,
+    )
+
+    def persist(mutate):
+        candidate = copy.deepcopy(persisted)
+        mutate(candidate)
+        persisted.clear()
+        persisted.update(candidate)
+        return candidate
+
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(config_api.sh, "dehydrator", dehydrator, raising=False)
+    monkeypatch.setattr(config_api.sh, "embedding_engine", None, raising=False)
+    monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", persist)
+    monkeypatch.setattr(config_api, "read_config_yaml", lambda: copy.deepcopy(persisted))
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](JsonRequest({
+        "dehydration": {"import_max_tokens": str(configured)},
+        "persist": True,
+    }))
+    refreshed = await mcp.routes[("GET", "/api/config")](
+        JsonRequest(method="GET")
+    )
+
+    assert response.status_code == 200
+    assert runtime["dehydration"]["import_max_tokens"] == configured
+    assert persisted["dehydration"]["import_max_tokens"] == configured
+    assert dehydrator.import_max_tokens == configured
+    assert _json(refreshed)["dehydration"]["import_max_tokens"] == configured
+    assert runtime["dehydration"]["max_tokens"] == 1024
+    assert runtime["dehydration"]["digest_max_tokens"] == 16384
+
+
+@pytest.mark.asyncio
+async def test_dashboard_reports_default_import_budget_for_old_config(monkeypatch):
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", {})
+    monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(config_api, "read_config_yaml", lambda: {})
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("GET", "/api/config")](
+        JsonRequest(method="GET")
+    )
+
+    assert response.status_code == 200
+    assert _json(response)["dehydration"]["import_max_tokens"] == 8192
+
+
+@pytest.mark.parametrize("configured", [32768, 9_007_199_254_740_991])
+def test_import_budget_runtime_accepts_safe_positive_integers(
+    tmp_path, configured
+):
+    from dehydrator import Dehydrator
+
+    dehydrator = Dehydrator({
+        "buckets_dir": str(tmp_path),
+        "dehydration": {"import_max_tokens": configured},
+    })
+    try:
+        assert dehydrator.import_max_tokens == configured
+    finally:
+        dehydrator._cache_conn.close()
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [0, -1, 1.5, True, "not-an-integer", 9_007_199_254_740_992],
+)
+def test_import_budget_runtime_falls_back_for_out_of_contract_values(
+    tmp_path, configured
+):
+    from dehydrator import Dehydrator
+
+    dehydrator = Dehydrator({
+        "buckets_dir": str(tmp_path),
+        "dehydration": {"import_max_tokens": configured},
+    })
+    try:
+        assert dehydrator.import_max_tokens == 8192
+    finally:
+        dehydrator._cache_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_old_dashboard_post_preserves_existing_import_budget(monkeypatch):
+    runtime = {
+        "dehydration": {
+            "model": "model",
+            "max_tokens": 1024,
+            "import_max_tokens": 6144,
+        }
+    }
+    persisted = copy.deepcopy(runtime)
+    dehydrator = SimpleNamespace(
+        model="model",
+        base_url="https://example.invalid/v1",
+        max_tokens=1024,
+        import_max_tokens=6144,
+        temperature=0.1,
+        timeout_seconds=60.0,
+        api_format="openai_compat",
+        extra_body={},
+        api_key="",
+        api_available=False,
+        client=None,
+    )
+
+    def persist(mutate):
+        candidate = copy.deepcopy(persisted)
+        mutate(candidate)
+        persisted.clear()
+        persisted.update(candidate)
+        return candidate
+
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(config_api.sh, "dehydrator", dehydrator, raising=False)
+    monkeypatch.setattr(config_api.sh, "embedding_engine", None, raising=False)
+    monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", persist)
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](JsonRequest({
+        "dehydration": {"max_tokens": 2048},
+        "persist": True,
+    }))
+
+    assert response.status_code == 200
+    assert runtime["dehydration"]["import_max_tokens"] == 6144
+    assert persisted["dehydration"]["import_max_tokens"] == 6144
+    assert dehydrator.import_max_tokens == 6144
 
 
 @pytest.mark.asyncio
@@ -924,12 +1105,15 @@ def test_mcp_token_regenerate_serializes_disk_and_runtime_commit_across_loops(
         {"host_port": 0},
         {"host_port": 65536},
         {"dehydration": {"max_tokens": 127}},
+        {"dehydration": {"import_max_tokens": 0}},
+        {"dehydration": {"import_max_tokens": 9_007_199_254_740_992}},
         {"dehydration": {"temperature": float("nan")}},
         {"dehydration": {"temperature": float("inf")}},
         {"dehydration": {"temperature": True}},
         {"dehydration": {"timeout_seconds": 0}},
         {"surfacing": {"breath_max_results": 0}},
         {"surfacing": {"breath_max_tokens": 499}},
+        {"surfacing": {"breath_max_tokens": 40001}},
         {"surfacing": {"feel_max_tokens": 20001}},
         {"surfacing": {"sampling": {"top_k": 0}}},
         {"surfacing": {"sampling": {"sample_k": 21}}},
@@ -993,7 +1177,7 @@ async def test_dashboard_config_persists_validated_numeric_types(monkeypatch):
                 "host_port": "8123",
                 "surfacing": {
                     "breath_max_results": "11",
-                    "breath_max_tokens": "12000",
+                    "breath_max_tokens": "35000",
                     "feel_max_tokens": "7000",
                     "sampling": {
                         "enabled": True,
@@ -1012,14 +1196,14 @@ async def test_dashboard_config_persists_validated_numeric_types(monkeypatch):
     assert runtime["host_port"] == 8123
     assert runtime["surfacing"] == {
         "breath_max_results": 11,
-        "breath_max_tokens": 12000,
+        "breath_max_tokens": 35000,
         "feel_max_tokens": 7000,
     }
     assert persisted["merge_threshold"] == 42
     assert persisted["host_port"] == 8123
     assert persisted["surfacing"] == {
         "breath_max_results": 11,
-        "breath_max_tokens": 12000,
+        "breath_max_tokens": 35000,
         "feel_max_tokens": 7000,
         "sampling": {
             "enabled": True,
@@ -1394,3 +1578,56 @@ async def test_retired_purge_endpoint_never_deletes_memory(monkeypatch):
     assert response.status_code == 410
     assert payload["error"] == "physical_deletion_forbidden"
     assert "Markdown 文件会继续保留" in payload["message"]
+
+
+# ============================================================
+# 时区设置：只给日期不写时区时按它理解（Letter 定时锁等）
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_timezone_persists_and_is_hot_applied(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    runtime = {"transport": "streamable-http"}
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", runtime)
+    monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(utils, "config_file_path", lambda: str(config_path))
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest({"timezone": "America/New_York", "persist": True})
+    )
+    payload = _json(response)
+    persisted = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    assert response.status_code == 200
+    assert "timezone" in payload["updated"]
+    assert persisted["timezone"] == "America/New_York"
+    # 时区是热更新项：不需要重启
+    assert config_api.sh.config["timezone"] == "America/New_York"
+
+
+@pytest.mark.asyncio
+async def test_invalid_timezone_is_rejected_instead_of_silently_falling_back(
+    monkeypatch, tmp_path
+):
+    """写进去一个解析不了的名字，之后每次解析日期都会静默回退 +08:00，
+    用户却以为自己设置成功了——必须当场拒绝。"""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", {"transport": "streamable-http"})
+    monkeypatch.setattr(config_api.sh, "in_docker", lambda: False)
+    monkeypatch.setattr(utils, "config_file_path", lambda: str(config_path))
+    mcp = FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/config")](
+        JsonRequest({"timezone": "Nowhere/Fake", "persist": True})
+    )
+
+    assert response.status_code == 400
+    assert "无法识别时区" in _json(response)["error"]
+    assert not config_path.exists() or "timezone" not in (
+        yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    )

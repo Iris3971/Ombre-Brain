@@ -49,6 +49,7 @@ try:
         get_ai_name as _get_ai_name,
         get_owner_name as _get_owner_name,
         get_owner_count as _get_owner_count,
+        get_timezone_name as _get_timezone_name,
         positive_float as _positive_float,
         parse_bool as _parse_bool,
         atomic_update_config_yaml,
@@ -59,6 +60,7 @@ except ImportError:  # pragma: no cover
         get_ai_name as _get_ai_name,
         get_owner_name as _get_owner_name,
         get_owner_count as _get_owner_count,
+        get_timezone_name as _get_timezone_name,
         positive_float as _positive_float,
         parse_bool as _parse_bool,
         atomic_update_config_yaml,
@@ -70,23 +72,23 @@ _MAX_PROVIDER_KEY_CHARS = 8192
 _MAX_PROVIDER_URL_CHARS = 2048
 _MAX_PROVIDER_FORMAT_CHARS = 64
 _MAX_ENV_VALUE_CHARS = 8192
+_JS_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 def _bounded_config_int(value, field: str, low: int, high: int) -> int:
+    constraint = f"in [{low},{high}]"
     if isinstance(value, bool):
-        raise ValueError(f"{field} must be an integer in [{low},{high}]")
+        raise ValueError(f"{field} must be an integer {constraint}")
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            f"{field} must be an integer in [{low},{high}]"
-        ) from exc
+        raise ValueError(f"{field} must be an integer {constraint}") from exc
     if isinstance(value, float) and (
         not math.isfinite(value) or value != parsed
     ):
-        raise ValueError(f"{field} must be an integer in [{low},{high}]")
-    if not low <= parsed <= high:
-        raise ValueError(f"{field} must be in [{low},{high}]")
+        raise ValueError(f"{field} must be an integer {constraint}")
+    if parsed < low or parsed > high:
+        raise ValueError(f"{field} must be {constraint}")
     return parsed
 
 
@@ -269,6 +271,15 @@ def register(mcp) -> None:
                 status_code=500,
             )
         dehy = sh.config.get("dehydration", {})
+        try:
+            import_max_tokens = _bounded_config_int(
+                dehy.get("import_max_tokens", 8192),
+                "dehydration.import_max_tokens",
+                1,
+                _JS_MAX_SAFE_INTEGER,
+            )
+        except ValueError:
+            import_max_tokens = 8192
         emb = sh.config.get("embedding", {})
         runtime_network_security = _runtime_network_security(
             desired["mcp_require_auth"]
@@ -281,6 +292,7 @@ def register(mcp) -> None:
                 "base_url": dehy.get("base_url", ""),
                 "api_key_masked": masked_key,
                 "max_tokens": dehy.get("max_tokens", 1024),
+                "import_max_tokens": import_max_tokens,
                 "temperature": dehy.get("temperature", 0.1),
                 "api_format": dehy.get("api_format", "openai_compat"),
                 "timeout_seconds": dehy.get("timeout_seconds", 60),
@@ -297,10 +309,12 @@ def register(mcp) -> None:
             },
             "surfacing": {
                 "breath_max_results": int(sh.config.get("surfacing", {}).get("breath_max_results") or 20),
-                "breath_max_tokens": int(sh.config.get("surfacing", {}).get("breath_max_tokens") or 10000),
-                "feel_max_tokens": int(sh.config.get("surfacing", {}).get("feel_max_tokens") or 6000),
+                "breath_max_tokens": int(sh.config.get("surfacing", {}).get("breath_max_tokens") or 20000),
+                "feel_max_tokens": int(sh.config.get("surfacing", {}).get("feel_max_tokens") or 15000),
             },
             "merge_threshold": sh.config.get("merge_threshold", 75),
+            # 只给日期不写时区时按它理解（Letter 定时锁等）。前端「设置」可改。
+            "timezone": _get_timezone_name(),
             "transport": desired["transport"],
             "transport_effective": runtime_transport,
             "buckets_dir": sh.config.get("buckets_dir", ""),
@@ -404,6 +418,13 @@ def register(mcp) -> None:
                     128,
                     8192,
                 )
+            if "import_max_tokens" in dehydration_payload:
+                dehydration_payload["import_max_tokens"] = _bounded_config_int(
+                    dehydration_payload["import_max_tokens"],
+                    "dehydration.import_max_tokens",
+                    1,
+                    _JS_MAX_SAFE_INTEGER,
+                )
             if "temperature" in dehydration_payload:
                 dehydration_payload["temperature"] = _bounded_config_float(
                     dehydration_payload["temperature"],
@@ -432,11 +453,41 @@ def register(mcp) -> None:
                 else None
             )
 
+            # --- Timezone ---
+            # 只给日期不写时区时按它理解。必须当场校验：写进去一个解析不了的
+            # 名字，之后每次解析日期都会静默回退 +08:00，用户以为自己设成功了。
+            timezone_value = None
+            if "timezone" in body:
+                raw_tz = str(body.get("timezone") or "").strip()
+                if raw_tz:
+                    if len(raw_tz) > 64:
+                        # 64 是随便定的。世界上最长的 IANA 时区名才 30 出头
+                        # （America/Argentina/ComodRivadavia，去查了，真的存在）。
+                        # 留一倍余量，剩下的当有人手滑。
+                        return JSONResponse(
+                            {"error": "timezone 名称过长"}, status_code=400
+                        )
+                    try:
+                        from zoneinfo import ZoneInfo
+
+                        ZoneInfo(raw_tz)
+                    except Exception:
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"无法识别时区「{raw_tz}」。请使用 IANA 时区名，"
+                                    "例如 Asia/Shanghai、UTC、America/New_York。"
+                                )
+                            },
+                            status_code=400,
+                        )
+                timezone_value = raw_tz
+
             surfacing_values: dict[str, int] = {}
             surfacing_payload = body.get("surfacing") or {}
             for key, low, high in (
                 ("breath_max_results", 1, 50),
-                ("breath_max_tokens", 500, 20000),
+                ("breath_max_tokens", 500, 40000),
                 ("feel_max_tokens", 500, 20000),
             ):
                 if key in surfacing_payload:
@@ -545,6 +596,7 @@ def register(mcp) -> None:
             "merge_threshold",
             "host_port",
             "surfacing",
+            "timezone",
         }
         if startup_setting_requested and hot_update_keys.intersection(body):
             return JSONResponse(
@@ -581,6 +633,7 @@ def register(mcp) -> None:
             "model",
             "base_url",
             "max_tokens",
+            "import_max_tokens",
             "temperature",
             "timeout_seconds",
             "api_format",
@@ -608,7 +661,7 @@ def register(mcp) -> None:
         if "dehydration" in body:
             d = dehydration_payload
             dehy = sh.config.setdefault("dehydration", {})
-            for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
+            for key in ("model", "base_url", "max_tokens", "import_max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
                 if key in d:
                     dehy[key] = d[key]
                     updated.append(f"dehydration.{key}")
@@ -619,6 +672,8 @@ def register(mcp) -> None:
             sh.dehydrator.model = dehy.get("model", sh.dehydrator.model)
             sh.dehydrator.base_url = dehy.get("base_url", sh.dehydrator.base_url)
             sh.dehydrator.max_tokens = int(dehy.get("max_tokens") or sh.dehydrator.max_tokens)
+            if "import_max_tokens" in d:
+                sh.dehydrator.import_max_tokens = int(d["import_max_tokens"])
             configured_temperature = dehy.get("temperature")
             if configured_temperature is not None:
                 sh.dehydrator.temperature = float(configured_temperature)
@@ -636,6 +691,7 @@ def register(mcp) -> None:
                         api_key=sh.dehydrator.api_key,
                         base_url=sh.dehydrator.base_url,
                         timeout=sh.dehydrator.timeout_seconds,
+                        max_retries=0,  # 重试归 Dehydrator._chat 管，见 dehydrator.py
                     )
                 except Exception as exc:
                     _rollback_hot_runtime()
@@ -701,6 +757,11 @@ def register(mcp) -> None:
             sh.config["merge_threshold"] = merge_threshold_value
             updated.append("merge_threshold")
 
+        # --- Timezone ---
+        if timezone_value is not None:
+            sh.config["timezone"] = timezone_value
+            updated.append("timezone")
+
         # MCP 鉴权开关、鉴权模式与公网地址都是启动期快照。它们只写入
         # config.yaml，不能提前发布到 sh.config；否则 OAuth/MCP 中间件仍使用
         # 旧闭包，而诊断与其他路由却会误以为新值已经生效。GET /api/config 会从
@@ -731,7 +792,7 @@ def register(mcp) -> None:
                     if not isinstance(sc_dehy, dict):
                         sc_dehy = {}
                         save_config["dehydration"] = sc_dehy
-                    for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
+                    for key in ("model", "base_url", "max_tokens", "import_max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
                         if key in dehydration_payload:
                             sc_dehy[key] = dehydration_payload[key]
                     # Never persist api_key to yaml (use env var)
@@ -751,6 +812,9 @@ def register(mcp) -> None:
 
                 if merge_threshold_value is not None:
                     save_config["merge_threshold"] = merge_threshold_value
+
+                if timezone_value is not None:
+                    save_config["timezone"] = timezone_value
 
                 if mcp_auth_value is not None:
                     security_candidate = dict(save_config)
@@ -1283,6 +1347,7 @@ def register(mcp) -> None:
                         api_key=staged_api_key,
                         base_url=staged_base_url,
                         timeout=staged_timeout,
+                        max_retries=0,  # 重试归 Dehydrator._chat 管，见 dehydrator.py
                     )
 
                 staged_attrs = {

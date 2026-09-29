@@ -27,7 +27,7 @@ tools/dream/output.py — dream 最终输出格式化
 - active plan 段：列未受 protected 保护且 status=active 的 plan（按 created 倒序）
 - 整体输出受 surfacing.dream_max_tokens（默认 20000）硬预算约束；只省略完整块，
   绝不截断正文
-- feel 历史段：排除 protected 后，按 surfacing.feel_max_tokens（默认 6000）对最终渲染块计费；
+- feel 历史段：排除 protected 后，按 surfacing.feel_max_tokens（默认 15000）对最终渲染块计费；
   新 feel 优先全文、老 feel 优先短摘录（放不下时在展示文本末尾直接拼「…」表示截断），
   放不下的仅报告省略数量
 
@@ -35,14 +35,22 @@ tools/dream/output.py — dream 最终输出格式化
 - 不做任何持久化写入
 - 不调 LLM
 
-对外暴露：format_dream_output(recent, all_buckets, window_hours,
+对外暴露：async format_dream_output(recent, all_buckets, window_hours,
                               connection_hint, crystal_hint) → str
 ========================================
 """
 
+from ombrebrain.storage.attribution import (
+    known_person_names,
+    names_from_config,
+    render_third_party_block,
+    split_third_party_speech,
+)
+
 from .. import _runtime as rt
 from ..i import is_pending_candidate
 from ..plan.core import is_letter_bucket
+from .feel_rank import rank_feels
 from utils import count_tokens_approx, parse_bool, strip_wikilinks
 
 
@@ -61,9 +69,25 @@ def _bucket_data_block(
     content: str | None = None,
     footprint: str = "",
 ) -> str:
-    """渲染一条桶：前缀 + 清理过双链的正文 + 可选 footprint 行。"""
+    """渲染一条桶：前缀 + 清理过双链的正文 + 第三方发言块 + 可选 footprint 行。
+
+    第三方发言（`名字：内容`）与 breath 走同一套判定移出正文、另起一条 JSON，
+    理由见 `ombrebrain.storage.attribution`。dream 是全篇一起喂给模型自省的，
+    第三方的话混在自省材料里被当成用户的话，比在 breath 里错得更远。
+
+    `content` 传摘录时同样要拆——老 feel 的短摘录一样会包含第三方发言，
+    只对全文拆等于给截断路径留了个没有归属标记的出口。
+    """
     body = _content_of(bucket) if content is None else content
-    rendered = display_prefix + strip_wikilinks(body)
+    body, third_party = split_third_party_speech(
+        strip_wikilinks(body),
+        known_names=known_person_names(bucket),
+        **names_from_config(getattr(rt, "config", None)),
+    )
+    rendered = display_prefix + body
+    speech_block = render_third_party_block(third_party)
+    if speech_block:
+        rendered += f"\n{speech_block}"
     if footprint:
         rendered += f"\n{footprint}"
     return rendered
@@ -89,7 +113,9 @@ def _format_self_review(
     放不下时返回空串。
     """
     candidates = list(getattr(self_review, "candidates", None) or [])
-    if not candidates:
+    ready = list(getattr(self_review, "ready", None) or [])
+    starved = int(getattr(self_review, "starved", 0) or 0)
+    if not candidates and not ready:
         return "", []
 
     threshold = int(getattr(self_review, "threshold", 3) or 3)
@@ -172,18 +198,44 @@ def _format_self_review(
         else:
             omitted += 1
 
-    if not rendered:
+    omitted += starved
+
+    # 攒够见证的：压成一行，不给碰撞材料，也**不计见证**。
+    #
+    # 它们不需要再被见证——3/3 之后再见证一百次也不会有任何变化。需要的是
+    # 模型去做那个决定：promote 或者让它沉下去。给它们完整块只会把还缺见证的
+    # 候选挤出预算，那正是「新的一直转不正」的来源。
+    ready_lines: list[str] = []
+    for candidate in ready:
+        bucket = candidate.bucket
+        meta = bucket.get("metadata") or {}
+        created = str(meta.get("created") or "")[:10]
+        text = str(bucket.get("content") or "").strip().replace("\n", " ")[:60]
+        ready_lines.append(
+            f"- {bucket['id']} {created}（{len(candidate.passes or [])}/{threshold} 次）{text}"
+        )
+
+    if not rendered and not ready_lines:
         return "", []
 
-    section = prefix + "\n---\n".join(rendered)
+    section = prefix + "\n---\n".join(rendered) if rendered else ""
     if omitted:
-        notice = f"\n\n（另有 {omitted} 条待沉淀候选因 dream 总预算未展开，这次不计见证。）"
+        notice = f"\n\n（另有 {omitted} 条待沉淀候选这次没展开，不计见证。）"
         if count_tokens_approx(final_text + section + notice) <= dream_budget:
             section += notice
+    if ready_lines:
+        ready_block = (
+            "\n\n=== 这几条已经攒够见证，等你决定 ===\n"
+            f"够 {threshold} 次了，它们不会自己进 I。觉得站得住就 "
+            "I(promote=\"...\")；觉得不成立就别再确认，让它跟普通记忆一样沉下去。\n"
+            + "\n".join(ready_lines)
+        )
+        if count_tokens_approx(final_text + section + ready_block) <= dream_budget:
+            section += ready_block
     return section, rendered_ids
 
 
-def format_dream_output(
+async def format_dream_output(
     recent: list,
     all_buckets: list,
     window_hours: int,
@@ -239,6 +291,8 @@ def format_dream_output(
         aro = float(meta.get("arousal") or 0.3)
         created = meta.get("created", "")
         last_active = meta.get("last_active", "")
+        from ombrebrain.storage.relation_store import relation_hint
+        hint = relation_hint(b)
         parts.append(
             (
                 b,
@@ -251,7 +305,7 @@ def format_dream_output(
                         f"ID: {b['id']}"
                         f"{_miss_lines(meta)}\n"
                     ),
-                    footprint=_footprint(b),
+                    footprint=(hint + "\n" if hint else "") + _footprint(b),
                 ),
             )
         )
@@ -380,6 +434,13 @@ def format_dream_output(
                     append_fragment(plan_fallback)
             elif plan_lines:
                 append_fragment(plan_prefix + "\n".join(plan_lines))
+        else:
+            # 没有 active plan 时明确说出来。之前这里什么都不输出，
+            # 「没有计划」和「plan 段被预算挤掉」在返回里长得一模一样。
+            # 没有计划就说没有计划，别让这段悄悄消失。
+            # 上次就是这样：40 个桶把预算吃满，plan 段被挤掉，
+            # 我以为是没写进去，翻了一晚上库。它一直在，只是没被打印。
+            append_fragment("\n\n=== 你的 active plans ===\n没有计划。")
     except Exception as e:
         rt.logger.warning(f"Dream active plans block failed: {e}")
 
@@ -394,23 +455,34 @@ def format_dream_output(
                 (b.get("metadata") or {}).get("protected"), default=False
             )
         ]
-        feels_all.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        # 3.2.0：从"最近写的 feel"改成"和这次在聊的事有关的 feel"。
+        # 基准是①段候选桶的合并文本——dream 本来就是在回顾这些桶。
+        reference_text = "\n".join(_content_of(b) for b in recent)[:20_000]
+        ranked, feel_vector_ok = await rank_feels(feels_all, reference_text)
+        feels_all = [feel for feel, _score in ranked]
         if feels_all:
             try:
-                feel_budget = int(surfacing_cfg.get("feel_max_tokens") or 6000)
+                feel_budget = int(surfacing_cfg.get("feel_max_tokens") or 15_000)
             except (TypeError, ValueError, OverflowError):
-                feel_budget = 6000
+                feel_budget = 15_000
             feel_budget = max(0, min(50_000, feel_budget))
             remaining_budget = max(
                 0,
                 dream_budget - count_tokens_approx(final_text),
             )
             feel_budget = min(feel_budget, remaining_budget)
+            degraded_note = (
+                ""
+                if feel_vector_ok
+                else "[检索降级：语义索引暂不可用，本段仅按关键词重合度排序。]\n"
+            )
             feel_header = (
-                "\n\n=== 你的 feel 历史（按最终渲染 token 预算）===\n"
-                "越新的 feel 优先保留全文；放不下时改为短摘录（末尾以「…」表示已截断）。\n"
-                "需要看未返回的 feel 可用 breath_advanced(query=..., domain=\"feel\") "
-                "或 trace 访问。\n\n"
+                "\n\n=== 和这次回顾相关的 feel（最多 5 条）===\n"
+                f"{degraded_note}"
+                "按与上面这些记忆的相关性挑选，不是按时间——所以这里没有的 feel "
+                "不代表不重要，只代表和这次聊的事没关系。\n"
+                "放不下时改为短摘录（末尾以「…」表示已截断）。\n"
+                "要按关键词找感受用 feel(query=...)。\n\n"
             )
             feel_lines: list[str] = []
             omitted = 0

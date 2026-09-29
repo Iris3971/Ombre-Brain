@@ -46,6 +46,7 @@ async def store_core(
     test_data: bool = False,
     explicit_domain: list[str] | None = None,
     source_refs: list[dict] | None = None,
+    quotes: list[dict] | None = None,
 ) -> str:
     metadata_fallback = False
     try:
@@ -89,6 +90,7 @@ async def store_core(
         name=suggested_name,
         title=final_title,
         source_refs=source_refs,
+        quotes=quotes,
         raw_merge=True,
         why_remembered=why_remembered,
         source_tool="hold",

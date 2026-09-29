@@ -14,6 +14,8 @@ from datetime import datetime
 
 import pytest
 
+from errors import ToolInputError
+
 from tools import dream
 from tools import _runtime as rt
 from tools.dream.hints import build_crystal_hint
@@ -146,10 +148,11 @@ async def test_promote_rejected_before_enough_dream_witnesses(env):
     await i_core.i_core(content="我觉得我更信任慢下来的判断。")
     bucket_id = next(iter(env.buckets))
 
-    out = await i_core.i_core(promote=bucket_id)
+    with pytest.raises(ToolInputError) as excinfo:
+        await i_core.i_core(promote=bucket_id)
 
-    assert "还不够" in out
-    assert f"0/{I_PROMOTE_THRESHOLD}" in out
+    assert "还不够" in str(excinfo.value)
+    assert f"0/{I_PROMOTE_THRESHOLD}" in str(excinfo.value)
     assert all(b["metadata"]["type"] != "i" for b in env.buckets.values())
 
 
@@ -198,9 +201,10 @@ async def test_promote_can_use_refined_wording(env):
 async def test_non_candidate_bucket_cannot_jump_into_i(env):
     plain = await env.create("一条普通记忆")
 
-    out = await i_core.i_core(promote=plain)
+    with pytest.raises(ToolInputError) as excinfo:
+        await i_core.i_core(promote=plain)
 
-    assert "不是 I 候选" in out
+    assert '不是 I 候选' in str(excinfo.value)
     assert all(b["metadata"]["type"] != "i" for b in env.buckets.values())
 
 
@@ -217,6 +221,22 @@ async def test_dream_shows_candidates_and_records_one_witness_per_day(env):
 
     # 同一天再做一次梦不该把念头刷成沉淀。
     await dream.dispatch(window_hours=48)
+    assert env.buckets[bucket_id]["metadata"]["i_dream_dates"] == [today]
+
+
+@pytest.mark.asyncio
+async def test_pending_candidate_outside_recent_window_still_gets_witnessed(env):
+    """A pending I candidate must not become impossible to promote with age."""
+    await i_core.i_core(content="我觉得这条旧候选仍需要完成沉淀。")
+    bucket_id = next(iter(env.buckets))
+    old = "2026-08-01T00:00:00"
+    await env.update(bucket_id, created=old, last_active=old)
+
+    out = await dream.dispatch(window_hours=48)
+
+    assert "我写下的「我觉得」（待沉淀）" in out
+    assert bucket_id in out
+    today = datetime.now().strftime("%Y-%m-%d")
     assert env.buckets[bucket_id]["metadata"]["i_dream_dates"] == [today]
 
 
@@ -482,9 +502,10 @@ async def test_promote_counts_distinct_dream_dates_only(env):
         i_dream_dates=["2026-08-01", "2026-08-01", "2026-08-02"],
     )
 
-    out = await i_core.i_core(promote=bucket_id)
+    with pytest.raises(ToolInputError) as excinfo:
+        await i_core.i_core(promote=bucket_id)
 
-    assert f"2/{I_PROMOTE_THRESHOLD}" in out
+    assert f"2/{I_PROMOTE_THRESHOLD}" in str(excinfo.value)
     assert all(b["metadata"]["type"] != "i" for b in env.buckets.values())
 
 
