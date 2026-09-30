@@ -31,6 +31,7 @@ import os
 from datetime import datetime
 
 from utils import parse_bool, parse_iso_datetime
+from ombrebrain.storage.letter_lock import is_letter_bucket
 
 logger = logging.getLogger("ombre_brain.decay")
 
@@ -453,11 +454,16 @@ class DecayEngine:
             # 也 resolved=True——plan 的生命周期只能由 status 字段驱动，letter
             # 承诺永久保留原样，两者都不该被这条「重要度低+超期未解决」的通用
             # 自动结案逻辑碰。
+            # letter 要按逻辑身份（is_letter_bucket：source_tool=letter 或
+            # __letter__ 标记）认，不能只看 type：2.16.4 以前钉选/取消钉选会把
+            # 信的 type 改成 permanent/dynamic，type=dynamic 的旧信若不在此跳过，
+            # 会被自动结案、衰减归档，letter_read 就再也看不见它（#84）。
             if (
                 meta.get("type") in ("permanent", "feel", "i", "plan", "letter")
                 or meta.get("pinned")
                 or meta.get("protected")
                 or parse_bool(meta.get("anchor"), default=False)
+                or is_letter_bucket(bucket)
             ):
                 continue
 

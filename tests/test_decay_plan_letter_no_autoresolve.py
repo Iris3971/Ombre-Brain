@@ -70,3 +70,61 @@ async def test_decay_cycle_still_auto_resolves_ordinary_dynamic_bucket(bucket_mg
     ordinary = await bucket_mgr.get(bid)
     assert ordinary["metadata"].get("resolved") is True
     assert stats["auto_resolved"] >= 1
+
+
+async def _create_relocated_letter(bucket_mgr, *, importance: int, days_ago: int) -> str:
+    """#84：2.16.4 以前取消钉选留下的旧信——type=dynamic、躺在 dynamic/letter 下。"""
+    bid = await bucket_mgr.create(
+        content="给新窗口的话",
+        tags=["__letter__"],
+        domain=["letter"],
+        importance=importance,
+        source_tool="letter",
+    )
+    fpath = bucket_mgr._find_bucket_file(bid)
+    post = fm.load(fpath)
+    post["type"] = "dynamic"
+    post["author"] = "AI"
+    post["pinned"] = False
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write(fm.dumps(post))
+    _backdate(bucket_mgr, bid, days_ago=days_ago)
+    return bid
+
+
+def _rel_parts(bucket_mgr, bucket_id: str) -> tuple[str, ...]:
+    import os
+
+    fpath = bucket_mgr._find_bucket_file(bucket_id)
+    rel = os.path.relpath(fpath, bucket_mgr.base_dir)
+    return tuple(rel.replace("\\", "/").split("/"))
+
+
+@pytest.mark.asyncio
+async def test_decay_cycle_skips_letter_whose_type_was_rewritten(bucket_mgr, decay_eng):
+    old = await _create_relocated_letter(bucket_mgr, importance=10, days_ago=365)
+    low = await _create_relocated_letter(bucket_mgr, importance=3, days_ago=60)
+    assert _rel_parts(bucket_mgr, old)[:2] == ("dynamic", "letter")
+
+    stats = await decay_eng.run_decay_cycle()
+
+    assert stats["archived"] == 0
+    old_b = await bucket_mgr.get(old)
+    assert old_b["metadata"]["type"] == "dynamic"
+    assert old_b["metadata"].get("resolved") is not True
+    assert _rel_parts(bucket_mgr, old)[0] == "dynamic"
+    low_b = await bucket_mgr.get(low)
+    assert low_b["metadata"].get("resolved") is not True
+    assert low_b["metadata"]["type"] == "dynamic"
+
+
+@pytest.mark.asyncio
+async def test_decay_cycle_still_archives_plain_bucket_in_letter_domain(bucket_mgr, decay_eng):
+    bid = await bucket_mgr.create(content="提到过信的一件旧事", domain=["letter"], importance=10)
+    _backdate(bucket_mgr, bid, days_ago=365)
+
+    stats = await decay_eng.run_decay_cycle()
+
+    assert stats["archived"] >= 1
+    b = await bucket_mgr.get(bid)
+    assert b["metadata"]["type"] == "archived"
