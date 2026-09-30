@@ -125,7 +125,7 @@ _WHY_REMEMBERED_MAX_CHARS = 500
 
 
 def _positive_safe_int(value, default: int) -> int:
-    """Parse a positive integer that survives Dashboard JSON round-trips."""
+    """解析能在 Dashboard JSON 往返中无损的正整数；bool、非整数小数、越界等非法值回退默认。"""
     if isinstance(value, bool):
         return int(default)
     try:
