@@ -7291,6 +7291,9 @@ async function refreshEmbInfo() {
       if (metaTxt) metaTxt += '<br>';
       metaTxt += '后台索引队列：待处理 ' + Number(queue.pending || 0)
         + ' · 重试中 ' + Number(queue.retrying || 0);
+      if (Number(queue.abandoned || 0) > 0) {
+        metaTxt += ' · 已放弃 ' + Number(queue.abandoned || 0);
+      }
       var circuit = queue.circuit || {};
       if (circuit.state === 'open') {
         metaTxt += ' · <span style="color:var(--negative,#c33)">' + _SV.warn

@@ -32,6 +32,10 @@ _DEFAULT_RETRY_MAX_SECONDS = 300.0
 _DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 3
 _DEFAULT_CIRCUIT_BASE_SECONDS = 30.0
 _DEFAULT_CIRCUIT_MAX_SECONDS = 600.0
+# 0 = 永不放弃（旧行为）。大于 0 时，只有「别的向量成功过、这一条仍失败」的次数
+# 攒够这么多次，才把这一条分量标成已放弃。
+_DEFAULT_ABANDON_AFTER_FAILURES = 0
+_ABANDONED_IDS_LIMIT = 20
 _IDLE_POLL_SECONDS = 30.0
 
 _COMPONENT_KINDS = ("content", "meaning")
@@ -41,6 +45,8 @@ _COMPONENT_RETRY_FIELDS = (
     "last_attempt_at",
     "last_error",
     "queued_at",
+    "strikes",
+    "abandoned_at",
 )
 
 _LOCAL_FILE_LOCKS_GUARD = threading.Lock()
@@ -228,6 +234,19 @@ class EmbeddingOutbox:
         )
         if self.circuit_max_seconds < self.circuit_base_seconds:
             self.circuit_max_seconds = self.circuit_base_seconds
+        try:
+            self.abandon_after_failures = max(
+                0,
+                int(
+                    embed_cfg.get(
+                        "abandon_after_failures",
+                        _DEFAULT_ABANDON_AFTER_FAILURES,
+                    )
+                    or 0
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            self.abandon_after_failures = _DEFAULT_ABANDON_AFTER_FAILURES
 
         self._lock = threading.RLock()
         self._items: dict[str, dict[str, Any]] = self._load_items()
@@ -245,6 +264,12 @@ class EmbeddingOutbox:
         # 过滤，永远拿不到向量），不该连累队列里所有其他合法待处理的记忆一起
         # 陪绑最长 10 分钟。见 _record_provider_failure()。
         self._last_failure_bucket_id = ""
+        # 放弃判据的证据只放在内存里：_success_seq 是本进程内 provider 真正
+        # 成功的次数，_failure_marks 记每个 (桶, 分量) 上次失败时的序号。
+        # 两次失败之间序号涨过，说明供应商那段时间是好的，这次失败才记一次罚点。
+        # 重启后第一次失败只打标不记罚，只会让放弃来得更晚（偏保守）。
+        self._success_seq = 0
+        self._failure_marks: dict[tuple[str, str], int] = {}
 
     @staticmethod
     def _hash_field(kind: str) -> str:
@@ -265,6 +290,27 @@ class EmbeddingOutbox:
             return max(
                 0,
                 int(item.get(cls._component_field(kind, "attempts")) or 0),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @classmethod
+    def _component_abandoned(cls, item: dict[str, Any], kind: str) -> bool:
+        return bool(item.get(cls._component_field(kind, "abandoned_at")))
+
+    @classmethod
+    def _component_active(cls, item: dict[str, Any], kind: str) -> bool:
+        """待处理且没有被放弃的分量，才会被调度和计入待处理数。"""
+        return cls._component_pending(item, kind) and not cls._component_abandoned(
+            item, kind
+        )
+
+    @classmethod
+    def _component_strikes(cls, item: dict[str, Any], kind: str) -> int:
+        try:
+            return max(
+                0,
+                int(item.get(cls._component_field(kind, "strikes")) or 0),
             )
         except (TypeError, ValueError, OverflowError):
             return 0
@@ -390,6 +436,9 @@ class EmbeddingOutbox:
             item[cls._component_field(kind, "next_attempt_at")] = 0.0
             item[cls._component_field(kind, "last_attempt_at")] = ""
             item[cls._component_field(kind, "last_error")] = ""
+            # 内容变了或调用方要求重来：放弃态与罚点一起清零。
+            item[cls._component_field(kind, "strikes")] = 0
+            item[cls._component_field(kind, "abandoned_at")] = ""
         else:
             item.setdefault(cls._component_field(kind, "attempts"), 0)
             item.setdefault(cls._component_field(kind, "next_attempt_at"), 0.0)
@@ -415,7 +464,43 @@ class EmbeddingOutbox:
     def set_embedding_engine(self, engine: Any) -> None:
         self.embedding_engine = engine
         self.reset_circuit()
+        # 换 key / 换模型是新证据：已放弃的分量重新给一次机会。
+        revived = 0
+        with self._lock:
+            with _exclusive_file_turn(self._file_lock_path):
+                self._reload_for_update_locked()
+                revived = len(self._revive_abandoned_locked())
+                if revived:
+                    self._persist_locked()
+        if revived:
+            logger.info(
+                "Embedding engine changed; revived %s abandoned item(s) / "
+                "更换向量引擎，重新尝试 %s 条已放弃的向量",
+                revived,
+                revived,
+            )
         self._wake()
+
+    def _revive_abandoned_locked(self) -> set[str]:
+        """把已放弃的分量恢复成立即到期的待处理状态；调用方持有两把锁。"""
+
+        revived: set[str] = set()
+        for bucket_id, item in self._items.items():
+            for kind in _COMPONENT_KINDS:
+                if not self._component_pending(item, kind):
+                    continue
+                if not self._component_abandoned(item, kind):
+                    continue
+                item[self._component_field(kind, "abandoned_at")] = ""
+                item[self._component_field(kind, "strikes")] = 0
+                item[self._component_field(kind, "attempts")] = 0
+                item[self._component_field(kind, "next_attempt_at")] = 0.0
+                self._failure_marks.pop((bucket_id, kind), None)
+                revived.add(bucket_id)
+            if bucket_id in revived:
+                item["updated_at"] = now_iso()
+                self._refresh_aggregate(item)
+        return revived
 
     def enqueue(self, bucket_id: str, content: str, *, reset_retry: bool = True) -> bool:
         """Upsert one desired index state and durably persist it."""
@@ -514,6 +599,8 @@ class EmbeddingOutbox:
                     return False
                 self._items.pop(bucket_id, None)
                 self._persist_locked()
+        for kind in _COMPONENT_KINDS:
+            self._failure_marks.pop((bucket_id, kind), None)
         return True
 
     def _discard_component(self, bucket_id: str, kind: str) -> bool:
@@ -535,6 +622,7 @@ class EmbeddingOutbox:
                 else:
                     self._items.pop(bucket_id, None)
                 self._persist_locked()
+        self._failure_marks.pop((bucket_id, kind), None)
         return True
 
     def complete_content(self, bucket_id: str, content: str) -> None:
@@ -561,14 +649,35 @@ class EmbeddingOutbox:
     def status(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_from_disk_locked()
-            items = [dict(item) for item in self._items.values()]
+            raw_items = [
+                (bucket_id, dict(item)) for bucket_id, item in self._items.items()
+            ]
+        items = [item for _bucket_id, item in raw_items]
+        # 已放弃的分量不再算待处理/重试中，单独计数；pending_ids() 仍含它们，
+        # 这样 reconcile 与漂移检查不会把它们当成「缺失且未排队」重复处理。
+        active = [
+            item
+            for item in items
+            if any(self._component_active(item, kind) for kind in _COMPONENT_KINDS)
+        ]
+        abandoned: list[tuple[str, str]] = []
+        for bucket_id, item in raw_items:
+            stamps = [
+                str(item.get(self._component_field(kind, "abandoned_at")) or "")
+                for kind in _COMPONENT_KINDS
+                if self._component_pending(item, kind)
+                and self._component_abandoned(item, kind)
+            ]
+            if stamps:
+                abandoned.append((min(stamps), bucket_id))
+        abandoned.sort()
         failed = [
             item
             for item in items
             if any(
                 self._component_attempts(item, kind) > 0
                 for kind in _COMPONENT_KINDS
-                if self._component_pending(item, kind)
+                if self._component_active(item, kind)
             )
         ]
         next_retry = min(
@@ -576,7 +685,7 @@ class EmbeddingOutbox:
                 self._component_due_at(item, kind)
                 for item in items
                 for kind in _COMPONENT_KINDS
-                if self._component_pending(item, kind)
+                if self._component_active(item, kind)
                 and self._component_due_at(item, kind) > 0
             ),
             default=0.0,
@@ -595,7 +704,8 @@ class EmbeddingOutbox:
                 )
                 for item in failed
                 for kind in _COMPONENT_KINDS
-                if self._component_attempts(item, kind) > 0
+                if self._component_active(item, kind)
+                and self._component_attempts(item, kind) > 0
             ]
             if attempts:
                 last_error = max(attempts, key=lambda value: value[0])[1]
@@ -606,8 +716,13 @@ class EmbeddingOutbox:
                 self.embedding_engine
                 and getattr(self.embedding_engine, "enabled", False)
             ),
-            "pending": len(items),
+            "pending": len(active),
             "retrying": len(failed),
+            "abandoned": len(abandoned),
+            "abandoned_ids": [
+                bucket_id for _stamp, bucket_id in abandoned[:_ABANDONED_IDS_LIMIT]
+            ],
+            "abandon_after_failures": self.abandon_after_failures,
             "processed": self._processed,
             "last_success": self._last_success,
             "last_error": last_error,
@@ -628,13 +743,20 @@ class EmbeddingOutbox:
         self._last_failure_bucket_id = ""
 
     def retry_now(self) -> int:
-        """Close the circuit and make every pending item immediately due."""
+        """Close the circuit and make every pending item immediately due.
+
+        手动重试（Dashboard「补齐缺失向量」）同时复活已放弃的分量。
+        """
         self.reset_circuit()
         changed = 0
         with self._lock:
             with _exclusive_file_turn(self._file_lock_path):
                 self._reload_for_update_locked()
-                for item in self._items.values():
+                revived = self._revive_abandoned_locked()
+                changed += len(revived)
+                for bucket_id, item in self._items.items():
+                    if bucket_id in revived:
+                        continue
                     item_changed = False
                     for kind in _COMPONENT_KINDS:
                         if not self._component_pending(item, kind):
@@ -870,10 +992,10 @@ class EmbeddingOutbox:
     @classmethod
     def _selected_component_kind(cls, item: dict[str, Any]) -> str:
         selected = str(item.get("_component_kind") or "")
-        if selected in _COMPONENT_KINDS and cls._component_pending(item, selected):
+        if selected in _COMPONENT_KINDS and cls._component_active(item, selected):
             return selected
         candidates = [
-            kind for kind in _COMPONENT_KINDS if cls._component_pending(item, kind)
+            kind for kind in _COMPONENT_KINDS if cls._component_active(item, kind)
         ]
         if not candidates:
             return ""
@@ -898,6 +1020,9 @@ class EmbeddingOutbox:
             self._refresh_from_disk_locked()
             current = self._items.get(bucket_id)
             if not current or current.get(self._hash_field(kind)) != digest:
+                return None
+            # 另一个进程可能刚把它标成已放弃。
+            if self._component_abandoned(current, kind):
                 return None
             if self._component_due_at(current, kind) > time.time():
                 return None
@@ -1013,6 +1138,9 @@ class EmbeddingOutbox:
                     "meaning",
                 )
                 return
+            if meaning_text:
+                # 只有 provider 真的生成成功才算「供应商是好的」的证据。
+                self._note_provider_success()
 
             latest = await self.bucket_mgr.get(bucket_id)
             if not latest:
@@ -1064,6 +1192,7 @@ class EmbeddingOutbox:
         if not ok:
             self._fail(bucket_id, digest, "generate_and_store returned false")
             return
+        self._note_provider_success()
 
         latest = await self.bucket_mgr.get(bucket_id)
         if not latest:
@@ -1078,6 +1207,10 @@ class EmbeddingOutbox:
             self.enqueue(bucket_id, latest_content)
             return
         self._complete_component(bucket_id, digest, "content")
+
+    def _note_provider_success(self) -> None:
+        with self._lock:
+            self._success_seq += 1
 
     def _complete(self, bucket_id: str, digest: str) -> None:
         """兼容旧测试/调用点：确认 content 分量完成。"""
@@ -1105,6 +1238,7 @@ class EmbeddingOutbox:
                 self._processed += 1
                 self._last_success = now_iso()
                 self._persist_locked()
+        self._failure_marks.pop((bucket_id, kind), None)
         self.reset_circuit()
         if remaining:
             self._wake()
@@ -1120,6 +1254,8 @@ class EmbeddingOutbox:
         error: Any,
         kind: str,
     ) -> None:
+        abandoned = False
+        strikes = 0
         with self._lock:
             with _exclusive_file_turn(self._file_lock_path):
                 self._reload_for_update_locked()
@@ -1143,6 +1279,26 @@ class EmbeddingOutbox:
                 current[self._component_field(kind, "next_attempt_at")] = (
                     time.time() + delay
                 )
+                # 罚点：上次失败之后别的向量成功过（供应商被证明是好的），
+                # 这一条还是失败，才记一次。全局故障期间没有成功，不记罚。
+                mark_key = (bucket_id, kind)
+                previous_mark = self._failure_marks.get(mark_key)
+                strikes = self._component_strikes(current, kind)
+                if previous_mark is not None and self._success_seq > previous_mark:
+                    strikes += 1
+                self._failure_marks[mark_key] = self._success_seq
+                current[self._component_field(kind, "strikes")] = strikes
+                if (
+                    self.abandon_after_failures > 0
+                    and strikes >= self.abandon_after_failures
+                    and not self._component_abandoned(current, kind)
+                ):
+                    # 只停掉这一条向量的重试；attempts/last_error 保留给面板看，
+                    # 条目留在 outbox 里，reconcile 才不会把它当缺失重新排队。
+                    current[self._component_field(kind, "abandoned_at")] = (
+                        attempted_at
+                    )
+                    abandoned = True
                 current["updated_at"] = attempted_at
                 self._refresh_aggregate(current)
                 self._persist_locked()
@@ -1151,6 +1307,17 @@ class EmbeddingOutbox:
         if bucket_id != self._last_failure_bucket_id:
             self._last_failure_bucket_id = bucket_id
             self._record_provider_failure()
+        if abandoned:
+            logger.warning(
+                "Embedding abandoned / 已放弃这条向量，记忆原文不受影响: "
+                "bucket=%s kind=%s attempts=%s strikes=%s error=%s",
+                bucket_id,
+                kind,
+                attempts,
+                strikes,
+                str(error)[:160],
+            )
+            return
         logger.warning(
             "Embedding queued for retry / embedding 将后台重试: "
             "bucket=%s kind=%s attempt=%s delay=%.1fs error=%s",
@@ -1199,7 +1366,7 @@ class EmbeddingOutbox:
             candidates: list[tuple[float, str, str, str, dict[str, Any]]] = []
             for bucket_id, item in self._items.items():
                 for kind in _COMPONENT_KINDS:
-                    if not self._component_pending(item, kind):
+                    if not self._component_active(item, kind):
                         continue
                     candidates.append(
                         (

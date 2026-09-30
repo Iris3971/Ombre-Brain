@@ -302,7 +302,7 @@ def _semantic_diagnostics(
             key: outbox_status.get(key)
             for key in (
                 "running", "provider_ready", "pending", "retrying",
-                "last_success", "last_error", "status_error",
+                "abandoned", "last_success", "last_error", "status_error",
             )
             if key in outbox_status
         },

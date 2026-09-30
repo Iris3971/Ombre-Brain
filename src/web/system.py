@@ -1003,6 +1003,7 @@ async def build_system_diagnostics() -> dict[str, Any]:
     emb_outbox = sh.embedding_outbox
     emb_queue = emb_outbox.status() if emb_outbox is not None else None
     emb_pending = int((emb_queue or {}).get("pending") or 0)
+    emb_abandoned = int((emb_queue or {}).get("abandoned") or 0)
     emb_circuit = (emb_queue or {}).get("circuit") or {}
     if not emb_enabled_cfg:
         emb_status = "error"
@@ -1030,6 +1031,17 @@ async def build_system_diagnostics() -> dict[str, Any]:
             f"连续失败 {int(emb_circuit.get('consecutive_failures') or 0)} 次）"
         )
         emb_action = "检查网络/额度；恢复后点击“补齐缺失向量”可立即重试"
+    elif emb_abandoned:
+        emb_status = "warning"
+        emb_message = (
+            f"有 {emb_abandoned} 条向量在供应商正常时仍反复失败，已放弃重试；"
+            "记忆原文不受影响"
+            + (f"（另有 {emb_pending} 条待处理）" if emb_pending else "")
+        )
+        emb_action = (
+            "检查这些记忆的内容长度或 provider 限制；"
+            "修改内容或点击“补齐缺失向量”会重新尝试"
+        )
     elif emb_pending:
         emb_status = "warning"
         emb_message = (
