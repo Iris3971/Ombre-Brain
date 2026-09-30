@@ -374,6 +374,41 @@ async def _stdio_lifespan(_server):
 # 用途：让「开口之前先 breath()」这类约定不依赖某一个入口的项目指令。config.mcp.instructions 设了才带，空串或没设就不带。
 _MCP_INSTRUCTIONS = ((config.get("mcp") or {}).get("instructions") if isinstance(config, dict) else None) or None
 
+
+def _compact_tool_result_enabled(cfg) -> bool:
+    """config.mcp.compact_tool_result 只认 YAML 布尔 true，其它值（字符串 "true"、1、缺省）一律当关。"""
+    mcp_cfg = cfg.get("mcp") if isinstance(cfg, dict) else None
+    return isinstance(mcp_cfg, dict) and mcp_cfg.get("compact_tool_result") is True
+
+
+# FastMCP 对带返回注解的 `-> str` 工具默认自动判为结构化：同一段文本会再包成
+# {"result": "..."} 放进 structuredContent，content 里还留一份（兼容老客户端），
+# 线上就是两份全文。把整个响应存进历史的客户端会按两份计费。
+# 开了之后所有工具（含动态挂载的 You/Them）只回 content，outputSchema 变 None，
+# content 文本逐字不变。默认关 = 3.6.4 以来的行为。
+# 配置在 import 时读取：改完要重启，已连接的客户端要重新连接（重新 list_tools），
+# 否则沿用旧会话缓存的 outputSchema 的客户端会报「有 output schema 却没有结构化内容」。
+_MCP_COMPACT_TOOL_RESULT = _compact_tool_result_enabled(config)
+
+
+def _use_unstructured_tool_results(target) -> None:
+    """让 target 上此后注册的工具默认不带结构化输出。
+
+    包的是 `_tool_manager.add_tool`：`@mcp.tool()` 经 FastMCP.add_tool 走到这里，
+    you/them 的 tool_gate 也直接调它，一处覆盖全部注册路径。
+    只把没指定（None）的改成 False；显式传了 True/False 的原样透传。
+    """
+    manager = target._tool_manager
+    original_add_tool = manager.add_tool
+
+    def add_tool(fn, *args, structured_output=None, **kwargs):
+        if structured_output is None:
+            structured_output = False
+        return original_add_tool(fn, *args, structured_output=structured_output, **kwargs)
+
+    manager.add_tool = add_tool
+
+
 mcp = FastMCP(
     "Ombre Brain",
     host=_BIND_HOST,
@@ -383,6 +418,10 @@ mcp = FastMCP(
     instructions=_MCP_INSTRUCTIONS,
     lifespan=_stdio_lifespan if config.get("transport", "stdio") == "stdio" else None,
 )
+
+if _MCP_COMPACT_TOOL_RESULT:
+    _use_unstructured_tool_results(mcp)
+    logger.info("[mcp] compact_tool_result on: tools return content only (no structuredContent / outputSchema)")
 
 # 3.4.0：信件并回主链路，`/mcp-extra` 再次退役。
 #

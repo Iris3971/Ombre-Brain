@@ -159,3 +159,89 @@ async def test_numeric_bucket_id_is_accepted_as_string(
 
     with pytest.raises(ToolError):
         await tool.run({**required, param: True})
+
+
+_LONG_TEXT = "浮现的记忆。" * 3000
+
+
+def _compact_probe_server(compact: bool):
+    from mcp.server.fastmcp import FastMCP
+
+    import server
+
+    m = FastMCP("t", json_response=True, stateless_http=True)
+    if compact:
+        server._use_unstructured_tool_results(m)
+
+    @m.tool()
+    def plain() -> str:
+        return _LONG_TEXT
+
+    def you() -> str:
+        return _LONG_TEXT
+
+    m._tool_manager.add_tool(you, name="You")
+
+    @m.tool(structured_output=True)
+    def explicit() -> str:
+        return _LONG_TEXT
+
+    return m
+
+
+@pytest.mark.asyncio
+async def test_default_keeps_output_schema_on_every_tool():
+    import server
+
+    assert server._MCP_COMPACT_TOOL_RESULT is False
+    tools = await server.mcp.list_tools()
+    assert tools
+    assert [t.name for t in tools if t.outputSchema is None] == []
+
+
+def test_compact_switch_only_accepts_yaml_true():
+    import server
+
+    on = server._compact_tool_result_enabled
+    assert on({"mcp": {"compact_tool_result": True}}) is True
+    for cfg in (
+        {"mcp": {"compact_tool_result": "true"}},
+        {"mcp": {"compact_tool_result": 1}},
+        {"mcp": {"compact_tool_result": False}},
+        {"mcp": {"compact_tool_result": None}},
+        {"mcp": None},
+        {},
+        None,
+    ):
+        assert on(cfg) is False, cfg
+
+
+@pytest.mark.asyncio
+async def test_compact_drops_structured_copy_for_decorated_and_dynamic_tools():
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    m = _compact_probe_server(compact=True)
+    async with create_connected_server_and_client_session(m) as client:
+        listed = {t.name: t for t in (await client.list_tools()).tools}
+        assert listed["plain"].outputSchema is None
+        assert listed["You"].outputSchema is None
+        assert listed["explicit"].outputSchema is not None
+        for name in ("plain", "You"):
+            result = await client.call_tool(name, {})
+            assert result.structuredContent is None
+            assert len(result.content) == 1
+            assert result.content[0].text == _LONG_TEXT
+        result = await client.call_tool("explicit", {})
+        assert result.structuredContent == {"result": _LONG_TEXT}
+
+
+@pytest.mark.asyncio
+async def test_without_compact_structured_copy_is_still_attached():
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    m = _compact_probe_server(compact=False)
+    async with create_connected_server_and_client_session(m) as client:
+        for name in ("plain", "You"):
+            result = await client.call_tool(name, {})
+            assert result.structuredContent == {"result": _LONG_TEXT}
+            assert result.content[0].text == _LONG_TEXT

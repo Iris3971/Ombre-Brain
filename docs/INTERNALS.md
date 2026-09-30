@@ -337,7 +337,7 @@ feel 桶自身：
 
 `omitted_by_policy` 是被 `dont_surface`/`digested` 挡掉的条数——给它是为了让「过滤有没有真的生效」可观测：静默为 0 和静默漏出来，在调用方眼里长得一样。
 
-> **为什么不用 `structuredContent`**：`-> str` 的工具今天已经有 `structuredContent`，但 FastMCP 把原始类型包成 `{"result": "<同一段渲染文本>"}`，没有信息量。要放进 `bucket_ids` 必须改成返回 `CallToolResult`（`content` 可保持逐字不变），代价是 `outputSchema` 从 `{"result": string}` 变成 `None`。3.6.4 选择不动返回类型，把契约放在文本里的独立块中。
+> **为什么不用 `structuredContent`**：`-> str` 的工具今天已经有 `structuredContent`，但 FastMCP 把原始类型包成 `{"result": "<同一段渲染文本>"}`，没有信息量。要放进 `bucket_ids` 必须改成返回 `CallToolResult`（`content` 可保持逐字不变），代价是 `outputSchema` 从 `{"result": string}` 变成 `None`。3.6.4 选择不动返回类型，把契约放在文本里的独立块中。testing 起可用 `config.mcp.compact_tool_result: true` 去掉这份 `{"result": ...}` 副本（所有工具只回 `content`、不声明 `outputSchema`；默认关，行为不变）。
 
 #### 检索的门：召回与排序目前没有分开（已知设计债）
 

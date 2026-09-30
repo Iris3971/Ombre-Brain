@@ -306,3 +306,4 @@ dream:
 # --- testing：MCP 握手说明（默认不带）---
 mcp:
   instructions: ""                # 设了就在 MCP 握手的 instructions 字段里交给客户端（claude.ai / Hermes 会转给模型）
+  compact_tool_result: false      # true = 工具只回 content，不再附同文的 structuredContent 副本、也不声明 outputSchema；把整个响应存进历史的客户端能省一半；改完重启，客户端重新连接
