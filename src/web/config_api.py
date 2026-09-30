@@ -1191,6 +1191,15 @@ def register(mcp) -> None:
         "AI_NAME":                 {"group": "identity", "sensitive": False, "in_memory": None},
     }
 
+    # 会在启动时压过 dashboard 字段的旧变量名（依据 utils.load_config：OMBRE_API_KEY /
+    # OMBRE_BASE_URL 在新名缺席时兜底写入 dehydration；OMBRE_COMPRESS_API_FORMAT 在
+    # OMBRE_COMPRESS_FORMAT 之后应用，两者都在时旧名生效）。只用来判断字段是否被接管。
+    _ENV_CONFIG_LEGACY_ALIASES: dict[str, tuple[str, ...]] = {
+        "OMBRE_COMPRESS_API_KEY": ("OMBRE_API_KEY",),
+        "OMBRE_COMPRESS_BASE_URL": ("OMBRE_BASE_URL",),
+        "OMBRE_COMPRESS_FORMAT": ("OMBRE_COMPRESS_API_FORMAT",),
+    }
+
     _ENV_CONFIG_NOTE = {
         "compress": "改完即时生效（进程内 sh.config 已更新），同时写 config.yaml 持久化（重启后仍有效）。",
         "embed": "API key / base_url / model 立即更新进程内 config；backend 切换请用「切换 / 重算所有 embedding…」按钮。",
@@ -1261,6 +1270,8 @@ def register(mcp) -> None:
           业务引擎热更新失败，会同时出现在 warnings 中；
         - persisted：已成功落盘、重启后仍会保留的变量名；
         - partial / warnings：运行时已生效但落盘失败，或部分字段未应用。
+          warnings 也可能包含「字段由启动时的环境变量接管、重启后会被覆盖」的
+          提示；这种情况本次保存本身是完整的，partial 仍为 False。
         """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
@@ -1473,6 +1484,30 @@ def register(mcp) -> None:
                 else "当前进程运行时与持久化配置均已更新。"
             ),
         }
+
+        # 启动时环境变量（含旧名）接管的字段：load_config 每次启动都会用它们盖掉
+        # config.yaml，本次保存会在重启/重建容器后失效。放在 partial 算完之后追加，
+        # 只提示、不改 ok/partial；只写变量名，不写值（多半是密钥）。
+        from utils import BOOT_ENV_CONFIG
+        shadowed: list[str] = []
+        for var in written:
+            aliases = [
+                a for a in _ENV_CONFIG_LEGACY_ALIASES.get(var, ())
+                if a in BOOT_ENV_CONFIG
+            ]
+            if aliases:
+                via = "及" if var in BOOT_ENV_CONFIG else "经"
+                shadowed.append(f"{var}（{via} {'、'.join(aliases)}）")
+            elif var in BOOT_ENV_CONFIG:
+                shadowed.append(var)
+        if shadowed:
+            warnings.append(
+                f"以下字段由启动时的环境变量接管（{', '.join(shadowed)}）："
+                "本次保存已在当前进程生效，但环境变量优先级更高，重启或重建容器后"
+                "会被它覆盖。要让此面板成为唯一来源，请到部署环境（平台环境变量，"
+                "或 .env / docker compose）删除这些变量后重建容器。"
+            )
+
         if warnings:
             response["warnings"] = warnings
         if not written:
