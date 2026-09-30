@@ -2,9 +2,9 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
-## 未发布（testing 分支）
+## 3.7.0
 
-> 从一个长期运行的实例里提出来的通用改动。全部默认关或行为不变，开关都在 config.example.yaml 里有注释。
+> testing 分支，待主负责人审核后合入 main。从一个长期运行的实例里提出来的通用改动。全部默认关或行为不变，开关都在 config.example.yaml 里有注释。
 > 下面的读数来自该实例的 LoCoMo / LongMemEval 跑分（同一读者、同一判卷），只供方向参考，不是可比的榜。
 
 ### 检索 / Retrieval
