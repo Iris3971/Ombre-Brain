@@ -621,16 +621,20 @@ class YouService:
         lines = ["[你自己写下的、关于对方的长期认识；不是此刻的事实，按需自行判断]"]
         if with_ids:
             lines.append("[带 id 是为了撤回：You(delete_id=\"...\")]")
+        正文条数 = 0
         for claim in candidates:
             if contains_forbidden_subject(claim.content):
                 continue
             next_line = "- " + claim.content
             if with_ids:
                 next_line += f"  [id={claim.id}]"
+            # 单条放不下只跳过这一条，不连累后面放得下的（同 #114 breath 侧）。
             if count_tokens_approx("\n".join([*lines, next_line])) > _MAX_HINT_TOKENS:
-                break
+                continue
             lines.append(next_line)
-        正文 = "\n".join(lines) if len(lines) > 1 else ""
+            正文条数 += 1
+        # 按正文条数判空：with_ids 时头部本身就是两行，不能拿行数判断。
+        正文 = "\n".join(lines) if 正文条数 else ""
         # 带了 query 就不附欠账。`recall(query="Lin")` 问的是「我对 Lin 了解
         # 什么」，拿一条还没算数的候选去回答它，正是三日门槛要防的事——标了
         # 「还没算数」也不行，那是答非所问。
