@@ -21,6 +21,7 @@ core（普通存入 + 自动合并）。
 ========================================
 """
 
+import re
 from typing import Optional
 
 from errors import ToolInputError, safe_error_detail
@@ -28,6 +29,7 @@ from ombrebrain.storage.media_store import MediaPersistenceError
 from ombrebrain.storage.quote_store import normalize_quotes
 from ombrebrain.storage.source_store import normalize_source_ranges
 from utils import normalize_memory_title, parse_bool
+from ombrebrain.storage.situation import normalize_kind, normalize_links, situation_for_write
 
 from .. import _runtime as rt
 from .._common import (
@@ -122,6 +124,9 @@ async def dispatch(
     source_content: Optional[str] = "",
     source_ranges: Optional[list] = None,
     quotes: Optional[list] = None,
+    context: Optional[dict] = None,
+    kind: Optional[str] = "",
+    links: Optional[dict] = None,
 ) -> str:
     content = "" if content is None else str(content)
     try:
@@ -267,7 +272,7 @@ async def dispatch(
     # 这里返回值只承载业务正文。
 
     try:
-        return await _store(
+        result = await _store(
             feel=feel,
             pinned=pinned,
             content=content,
@@ -293,6 +298,47 @@ async def dispatch(
         # 为什么不让 media_store 直接抛 ToolInputError：ombrebrain/ 这个包
         # 全文零处 import 顶层 errors 模块，那条分层边界比省一层翻译值钱。
         raise ToolInputError(str(exc)) from exc
+    return await attach_extras(result, context=context, kind=kind, links=links)
+
+
+_NEW_ID_RE = re.compile(r"(?:新建|feel)→([A-Za-z0-9_\-]{6,40})")
+
+
+async def attach_extras(result: str, *, context=None, kind="", links=None) -> str:
+    """新桶落盘之后补三样元数据——情境指纹（situation）、要义/回忆版本的
+    类型（kind → type）和链接（links）。
+
+    只对**新建**的桶做（合并→ 的老桶有它自己的场，不覆盖）。这一步失败不影响正文：
+    正文已经逐字落盘，这里只追加一行警告。situation 永不进向量和检索算分，见
+    ombrebrain/storage/situation.py 顶部。
+    """
+    m = _NEW_ID_RE.search(result or "")
+    if not m:
+        return result
+    bucket_id = m.group(1)
+    extras: dict = {}
+    try:
+        sit = situation_for_write(context, getattr(rt, "config", None))
+        if sit:
+            extras["situation"] = sit
+    except Exception as exc:
+        rt.logger.warning(f"situation build failed / 情境指纹没算出来: {exc}")
+    normalized_kind = normalize_kind(kind)
+    if normalized_kind:
+        extras["type"] = normalized_kind
+    normalized_links = normalize_links(links)
+    if normalized_links:
+        extras["links"] = normalized_links
+    if not extras:
+        return result
+    try:
+        ok = await rt.bucket_mgr.update(bucket_id, **extras)
+    except Exception as exc:
+        rt.logger.warning(f"attach extras failed / 情境或链接没写上 {bucket_id}: {exc}")
+        ok = False
+    if not ok:
+        return result + "\n⚠️ 情境/链接没写上（正文已保存）：" + ",".join(sorted(extras))
+    return result
 
 
 async def _store(

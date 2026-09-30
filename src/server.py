@@ -369,12 +369,17 @@ async def _stdio_lifespan(_server):
         await lifecycle.stop()
 
 
+# 握手时交给客户端的一段说明（MCP 协议的 instructions 字段，claude.ai / Hermes 一类客户端会交给模型）。
+# 用途：让「开口之前先 breath()」这类约定不依赖某一个入口的项目指令。config.mcp.instructions 设了才带，空串或没设就不带。
+_MCP_INSTRUCTIONS = ((config.get("mcp") or {}).get("instructions") if isinstance(config, dict) else None) or None
+
 mcp = FastMCP(
     "Ombre Brain",
     host=_BIND_HOST,
     port=OMBRE_PORT,
     json_response=True,
     stateless_http=True,
+    instructions=_MCP_INSTRUCTIONS,
     lifespan=_stdio_lifespan if config.get("transport", "stdio") == "stdio" else None,
 )
 

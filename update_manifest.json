@@ -42,13 +42,13 @@
     },
     {
       "path": "src/bucket_manager.py",
-      "sha256": "232554acf2345fd8a35f240a45ae36467d57fbe199e6556a9bae3bd8477c6d45",
-      "size": 192172
+      "sha256": "c581e7ab4ac7763e95757ceeee4ce0a5f43a8aab78cd1b7b0912355501e17b91",
+      "size": 198049
     },
     {
       "path": "src/decay_engine.py",
-      "sha256": "2571e786e98bc8014c95237da5044648df107bf66e1c864b98e36a91bb19ca92",
-      "size": 22554
+      "sha256": "979cecf6722ff19aa1974d916e7c641aeaf48aaeb3de64083a86f3a6a6f34226",
+      "size": 29771
     },
     {
       "path": "src/dehydrator.py",
@@ -377,8 +377,8 @@
     },
     {
       "path": "src/ombrebrain/retrieval/bucket_scoring.py",
-      "sha256": "ccaaf551984bb3ee434ca905e3841b4c30ab61a284544e7b709d634dff7d9254",
-      "size": 5421
+      "sha256": "12414aacaa1d100df126ff010d7c5d8fbb61d2628a749674aa1be24ffb8bf17a",
+      "size": 6524
     },
     {
       "path": "src/ombrebrain/retrieval/context.py",
@@ -391,9 +391,19 @@
       "size": 1234
     },
     {
+      "path": "src/ombrebrain/retrieval/hop.py",
+      "sha256": "c071fcec1bde41a708c393019e079f2cde9d7edbb5c5323242e3a88d975792a1",
+      "size": 7697
+    },
+    {
       "path": "src/ombrebrain/retrieval/planner.py",
       "sha256": "6c07dfb3bdb979ec7f2179c181081166c5bcb85ac6d386373b7b0961ced9c712",
       "size": 3253
+    },
+    {
+      "path": "src/ombrebrain/retrieval/rerank.py",
+      "sha256": "c58bafe7448b46bf827c943ed99a76f1a0977fa434bbc317928b0ebf5e93eda2",
+      "size": 3596
     },
     {
       "path": "src/ombrebrain/retrieval/scoring.py",
@@ -469,6 +479,11 @@
       "path": "src/ombrebrain/storage/relation_store.py",
       "sha256": "b8327824a13c81272dc22021a83632e298ebfaa93c71049fcb68db85a70eb062",
       "size": 12785
+    },
+    {
+      "path": "src/ombrebrain/storage/situation.py",
+      "sha256": "01c5dea9b018d7419b214763b5d904ca37570bd0d477b0ba4a3da81eda40ee99",
+      "size": 10790
     },
     {
       "path": "src/ombrebrain/storage/source_store.py",
@@ -562,8 +577,8 @@
     },
     {
       "path": "src/server.py",
-      "sha256": "02107c88da366840c08b98bf8493910c57fb01f7cede781d431d187c914b83ed",
-      "size": 80622
+      "sha256": "523fba313a5cf5dec7f6d9bf80e934fdfe604101ce3201d1e7359e5605461564",
+      "size": 81074
     },
     {
       "path": "src/server_app.py",
@@ -602,8 +617,8 @@
     },
     {
       "path": "src/tools/breath/__init__.py",
-      "sha256": "4f22c2285bfbbc0ed19c08762eed5d9b3ebb6951634429131d42c65948dab955",
-      "size": 8912
+      "sha256": "27713145ebcd50a4c6fdf1e00e062b1fc11dfb69b66a4030087c03c923cb6de7",
+      "size": 10081
     },
     {
       "path": "src/tools/breath/_date_range.py",
@@ -637,18 +652,18 @@
     },
     {
       "path": "src/tools/breath/search.py",
-      "sha256": "f1b0b2f5f746ddcc493ff21bd920e3cc1ddde03ada93ac5f1085734570f80ed5",
-      "size": 21914
+      "sha256": "6d268d64d366fa96704b6edce40bcb0d6e395c1e6b7d82c81abfa8085fbe2d01",
+      "size": 28874
     },
     {
       "path": "src/tools/breath/surface.py",
-      "sha256": "62bcbf126ab3f096a57eda77c48c3adaf98cff2aedef0bcfed0a3c84427caefa",
-      "size": 25485
+      "sha256": "104bc03ffcfc2f2d54708d21436f7d5672d7f437da99efa78818440f587103f5",
+      "size": 28923
     },
     {
       "path": "src/tools/dream/__init__.py",
-      "sha256": "a2eb9d95e2c511f1abf3ab12a507882d05b9f0afcee8ecf2d21c0b945c1f7821",
-      "size": 4500
+      "sha256": "5f10590868773f84d3b47850207725e4d833b8dff3d135cfaf56b80a8d025bf2",
+      "size": 5099
     },
     {
       "path": "src/tools/dream/candidates.py",
@@ -662,13 +677,13 @@
     },
     {
       "path": "src/tools/dream/hints.py",
-      "sha256": "27ab9a6ae86c6549b815fd5b3dcbd7b79d5ebbb72dc83f5f8e93de755832b0f5",
-      "size": 14380
+      "sha256": "04adb37b97c5d002745e0d8811ee9ff21bb6de2c2b5f17a7688f7fb5383f49b9",
+      "size": 19711
     },
     {
       "path": "src/tools/dream/output.py",
-      "sha256": "ad37ee52e158ac10925cdaf02a9e16a2e61f91bad83ac5f74bfddb67ac46a609",
-      "size": 25319
+      "sha256": "56c5276033d390bf90b4a9da8a2cc471aff876932c73eec91fa2dc007946a338",
+      "size": 25487
     },
     {
       "path": "src/tools/grow/__init__.py",
@@ -692,8 +707,8 @@
     },
     {
       "path": "src/tools/hold/__init__.py",
-      "sha256": "72de6e2c8a2d34b2382bc532dc1838762c6e77a641d8a67a81756466e1260484",
-      "size": 13894
+      "sha256": "6ed6895f8e5d5f548b059160a8764b73235f43a335716d12d760afe551458be7",
+      "size": 15817
     },
     {
       "path": "src/tools/hold/core.py",
@@ -717,8 +732,8 @@
     },
     {
       "path": "src/tools/i/core.py",
-      "sha256": "f048160cbccf668fcefdeb63ffbcc26fb233943ae5b3e317004044742c2a54e3",
-      "size": 26729
+      "sha256": "7017ee6efd7faa8c3710c83178d8984e0bff5d59291edf8902183826052a944f",
+      "size": 28527
     },
     {
       "path": "src/tools/plan/__init__.py",
@@ -727,8 +742,8 @@
     },
     {
       "path": "src/tools/plan/core.py",
-      "sha256": "785b2788f4528de882506754db5cbcc15b34032d9cb030acc8f96c3b7ee88e1a",
-      "size": 23184
+      "sha256": "74e727b63a201897537602647bcb86e5eecc477e2fc55a915e69d7be188cb38c",
+      "size": 23509
     },
     {
       "path": "src/tools/them/__init__.py",

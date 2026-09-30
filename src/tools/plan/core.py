@@ -37,6 +37,7 @@ from .._common import (
 )
 from utils import strip_wikilinks, get_ai_name, get_owner_name, get_tzinfo, get_timezone_name
 from errors import ToolInputError, safe_error_detail
+from ombrebrain.storage.situation import normalize_cue
 # 锁语义 3.6.5 下沉到 ombrebrain/storage/letter_lock.py：you / them 的证据闸
 # 也要判「这封信对 AI 开没开」，而 ombrebrain 不能反向 import tools。
 # 这里按原名再导出，所有既有调用点不变。
@@ -193,6 +194,7 @@ async def plan_create(
     related_bucket: Optional[str] = "",
     weight: Optional[float] = 0.5,
     why_remembered: Optional[str] = "",
+    cue: Optional[dict] = None,
 ) -> str:
     if status is None:
         status = "active"
@@ -258,6 +260,10 @@ async def plan_create(
     from .._common import append_plan_change_log
     initial_log = append_plan_change_log([], "created", to=status, by="plan")
     update_kwargs = {"status": status, "change_log": initial_log}
+    # 前瞻记忆的线索。plan 不再只在 dream 末尾被列一遍——线索场按 cue 命中时把它摆到那一刻。
+    normalized_cue = normalize_cue(cue)
+    if normalized_cue:
+        update_kwargs["cue"] = normalized_cue
     if related_bucket.strip():
         update_kwargs["related_bucket"] = related_bucket.strip()
     try:

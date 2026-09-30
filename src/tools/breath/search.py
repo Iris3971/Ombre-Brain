@@ -35,6 +35,8 @@ import random
 from datetime import datetime
 
 from ombrebrain.policy.surfacing import SurfacePolicyVM
+from ombrebrain.retrieval.rerank import rerank_buckets, rerank_config
+from ombrebrain.retrieval.hop import expand as hop_expand, hop_config
 from .. import _runtime as rt
 from ..plan.core import is_letter_bucket
 from ombrebrain.storage.attribution import names_from_config
@@ -110,6 +112,100 @@ def _is_archived(bucket: dict) -> bool:
         or bool(meta.get("deleted_at"))
         or bool(meta.get("tombstone"))
     )
+
+
+def _when(meta: dict) -> str:
+    """命中头部的日期标签 `[2026-08-27 周四] `。
+    读答实验：答题模型看得到每条的日期、被要求按日期推，LME 正确率 0.64→0.80。
+    config retrieval.surface_created 开关，默认关；created 缺失或写坏返回空串。"""
+    cfg = getattr(rt, "config", None) or {}
+    flag = ((cfg.get("retrieval") or {}) if isinstance(cfg, dict) else {}).get("surface_created", False)
+    if not parse_bool(flag, default=False):
+        return ""
+    raw = str((meta or {}).get("created") or "").strip()[:19]
+    try:
+        t = datetime.fromisoformat(raw)
+    except Exception:
+        return ""
+    return "[%s 周%s] " % (t.strftime("%Y-%m-%d"), "一二三四五六日"[t.weekday()])
+
+
+def _collapse_config(config) -> dict:
+    cfg = ((config or {}).get("retrieval") or {}).get("collapse_covered") or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    try:
+        keep = max(1, int(cfg.get("keep", 2) or 2))
+    except (TypeError, ValueError):
+        keep = 2
+    try:
+        min_group = max(2, int(cfg.get("min_group", 3) or 3))
+    except (TypeError, ValueError):
+        min_group = 3
+    return {"enabled": parse_bool(cfg.get("enabled", False), default=False), "keep": keep, "min_group": min_group}
+
+
+def collapse_covered(matches: list, pool: list, config, call_mode: str = "search") -> list:
+    """同款折叠——被同一条要义盖住的命中只留 keep 条，要义顶在第一条前面。
+
+    「上次读到第几回」六条同款并排，读的人挑不出哪条是哪次；人记住的是"雨天读红楼梦总会停在某句上"
+    这一句加上一两次具体的。要义 = type gist 的桶（她自己写的），links.sources 是它盖住的事件。
+    只改顺序和取舍，不动分数、不动任何桶；在截断之前做，掉出去的位置由后面的候选补上。
+    """
+    cfg = _collapse_config(config)
+    if not cfg["enabled"] or len(matches) < cfg["min_group"]:
+        return matches
+    gist_of: dict = {}
+    for b in pool or []:
+        meta = (b or {}).get("metadata") or {}
+        if str(meta.get("type") or "") != "gist":
+            continue
+        links = meta.get("links") or {}
+        srcs = links.get("sources") if isinstance(links, dict) else None
+        for sid in srcs or []:
+            gist_of.setdefault(str(sid), b)
+    if not gist_of:
+        return matches
+    groups: dict = {}
+    for b in matches:
+        g = gist_of.get(str(b.get("id") or ""))
+        if g is not None:
+            groups.setdefault(str(g.get("id")), []).append(str(b.get("id")))
+    big = {gid for gid, members in groups.items() if len(members) >= cfg["min_group"]}
+    if not big:
+        return matches
+    out, seen, inserted = [], {}, set()
+    for b in matches:
+        bid = str(b.get("id") or "")
+        if bid in inserted:
+            continue  # 要义已经被顶到它盖住的第一条前面了，原位置不再重复
+        g = gist_of.get(bid)
+        gid = str(g.get("id")) if g is not None else ""
+        if gid in big:
+            n = seen.get(gid, 0)
+            if n == 0 and gid not in inserted and _can_surface_search(g, call_mode):
+                out.append(g)
+                inserted.add(gid)
+            if n >= cfg["keep"]:
+                continue
+            seen[gid] = n + 1
+        out.append(b)
+    return out
+
+
+def _gist_tag(meta: dict) -> str:
+    """要义头部：[要义·15 件 08-14~09-10] 。links 里没数就只标 [要义]。"""
+    links = (meta or {}).get("links") or {}
+    if not isinstance(links, dict):
+        return "[要义] "
+    n = links.get("n")
+    span = links.get("span") or []
+    try:
+        rng = "%s~%s" % (str(span[0])[5:10], str(span[1])[5:10]) if len(span) >= 2 else ""
+    except Exception:
+        rng = ""
+    inner = "要义" + ("·%s 件" % n if n else "") + ((" " + rng) if rng else "")
+    return "[%s] " % inner
 
 
 def _render_archived_hit(bucket: dict, footprint: str) -> tuple[str, int]:
@@ -314,8 +410,16 @@ async def surface_search(
     semantic_diag = _semantic_diagnostics(query, vector_scores, semantic_notice)
     rt.logger.info("op=breath_search phase=semantic diagnostics=%s", semantic_diag)
 
+    # 重排开着时候选池要比 max_results 大，重排完再截
+    _rr = rerank_config(getattr(rt, "config", None))
+    all_for_hop: list = []
+    if hop_config(getattr(rt, "config", None))["enabled"] or _collapse_config(getattr(rt, "config", None))["enabled"]:
+        try:
+            all_for_hop = await rt.bucket_mgr.list_all(include_archive=False)
+        except Exception as exc:
+            rt.logger.warning(f"hop list_all failed: {exc}")
     search_kwargs = {
-        "limit": max(max_results, 20),
+        "limit": max(max_results, 20, _rr["pool"] if _rr["enabled"] else 0),
         "domain_filter": domain_filter,
         "query_valence": q_valence,
         "query_arousal": q_arousal,
@@ -336,10 +440,16 @@ async def surface_search(
         rt.logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
+    # 自动召回（agent 每轮注入）时，准则桶不当检索命中——它们每轮睁眼 breath() 已经在场，
+    # 这里再出现一次是重复，还会顶掉真正相关的事。显式 query（manual）照旧能搜到。
+    _hide_core = call_mode == "automatic" and parse_bool(
+        ((getattr(rt, "config", None) or {}).get("matching") or {}).get("automatic_hides_core"), default=False)
     eligible_matches = []
     for bucket in matches:
         meta = bucket.get("metadata", {}) or {}
         if is_letter_bucket(bucket):
+            continue
+        if _hide_core and (parse_bool(meta.get("pinned"), default=False) or str(meta.get("type") or "") == "permanent"):
             continue
         if _is_archived(bucket):
             original_kind = _footprint.original_kind(
@@ -364,6 +474,23 @@ async def surface_search(
         b for b in matches
         if bucket_in_created_range(b, created_from, created_to)
     ]
+    # 一跳扩展——命中旁边的（前后 / 同实体 / 已有链接）也进池子，交给重排决定去留
+    if hop_config(getattr(rt, "config", None))["enabled"] and matches:
+        try:
+            _pool = [b for b in all_for_hop if _can_surface_search(b, call_mode) and not is_letter_bucket(b)
+                     and (b.get("metadata") or {}).get("type") not in ("feel", "plan", "letter")]
+            matches = hop_expand(matches, _pool, getattr(rt, "config", None))
+        except Exception as exc:
+            rt.logger.warning(f"hop expand failed / 一跳扩展失败: {exc}")
+    if _rr["enabled"] and len(matches) > 1:
+        matches = await rerank_buckets(query, matches, max_results, getattr(rt, "config", None))
+    # 同款折叠（要义盖住的只留 keep 条，要义顶前面），截断之前做
+    try:
+        _before = len(matches)
+        matches = collapse_covered(matches, all_for_hop, getattr(rt, "config", None), call_mode)
+        rt.logger.info("op=breath_search phase=collapse pool=%d before=%d after=%d", len(all_for_hop), _before, len(matches))
+    except Exception as exc:
+        rt.logger.warning(f"collapse covered failed / 同款折叠失败: {exc}")
     matches = matches[:max_results]
     rt.logger.info(
         "op=breath_search phase=ranking query_hash=%s matches=%s ids=%s",
@@ -381,22 +508,27 @@ async def surface_search(
         if _is_archived(bucket):
             rendered, entry_tokens = _render_archived_hit(bucket, _footprint(bucket))
         elif parse_bool(meta.get("protected"), default=False):
-            header = f"🛡️ [受保护记忆] [bucket_id:{bucket_id}]"
+            header = _when(meta) + f"🛡️ [受保护记忆] [bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
         elif meta.get("pinned") or meta.get("type") == "permanent":
-            header = f"📌 [核心准则] [bucket_id:{bucket_id}]"
+            header = _when(meta) + f"📌 [核心准则] [bucket_id:{bucket_id}]"
+            rendered, entry_tokens = render_stored_bucket(
+                bucket, header, _footprint(bucket)
+            )
+        elif str(meta.get("type") or "") == "gist":
+            header = _when(meta) + _gist_tag(meta) + f"[bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
         elif bucket.get("vector_match"):
-            header = f"[语义关联] [bucket_id:{bucket_id}]"
+            header = _when(meta) + f"[语义关联] [bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
         else:
-            header = f"[bucket_id:{bucket_id}]"
+            header = _when(meta) + f"[bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
@@ -450,6 +582,11 @@ async def surface_search(
                 and not parse_bool(
                     b["metadata"].get("protected"), default=False
                 )
+                # fork-only：技术备忘不参与「忽然想起来」的随机浮现。
+                # 正常检索照旧命中 —— 这是我们相对上游唯一的改动。
+                and not parse_bool(
+                    b["metadata"].get("no_drift"), default=False
+                )
                 and rt.decay_engine.calculate_score(b["metadata"]) < 2.0
                 and bucket_in_created_range(b, created_from, created_to)
             ]
@@ -463,7 +600,7 @@ async def surface_search(
                 for b in drifted:
                     rendered, entry_tokens = render_stored_bucket(
                         b,
-                        f"[联想浮现·非检索命中] [bucket_id:{b['id']}]",
+                        _when(b.get("metadata") or {}) + f"[联想浮现·非检索命中] [bucket_id:{b['id']}]",
                         _footprint(b),
                     )
                     if token_used + entry_tokens > max_tokens:

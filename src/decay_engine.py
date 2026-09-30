@@ -22,9 +22,12 @@ decay_engine.py — 记忆衰减引擎，模拟人类遗忘曲线
 ========================================
 """
 
+import io
+import json
 import math
 import asyncio
 import logging
+import os
 from datetime import datetime
 
 from utils import parse_bool, parse_iso_datetime
@@ -91,6 +94,14 @@ _DEFAULT_AROUSAL = 0.3
 _DEFAULT_IMPORTANCE = 5
 _DEFAULT_DAYS_FALLBACK = 30  # calculate_score 时间字段坏 → 按 30 天处理（保守）
 
+# --- ACT-R 参数 ---
+_ACTR_D = 0.5                    # 幂律遗忘指数，文献默认 0.5；库比实验室稀疏，可能要 0.3
+_ACTR_MIN_DAYS = 0.05            # t 的下限（刚写下 = 1.2 小时），防 0^-d
+_ACTR_RESOLVED_FACTOR = 0.5      # 结案的淡得快一点，但不是上游的 ×0.05——那会让 imp≤4 的事
+                                 # 在 30 天自动结案那天就归档，独特与否都一样
+_ACTR_RESOLVED_DIGESTED = 0.3
+_COVERAGE_TTL_SEC = 600.0
+
 # --- 时间换算 ---
 _SECONDS_PER_DAY = 86400
 _SECONDS_PER_HOUR = 3600
@@ -143,6 +154,22 @@ class DecayEngine:
         self.arousal_boost = emotion_cfg.get("arousal_boost", _DEFAULT_AROUSAL_BOOST)
 
         self.bucket_mgr = bucket_mgr
+
+        # --- decay.model = "ebbinghaus"（默认，上游公式）| "actr" ---
+        # ACT-R 基础激活（Anderson & Schooler 1991）：可及性 = Σ_j t_j^(-d)，t_j 是距每次
+        # 「写下 / 想起 / 显式强化」的天数。刚想起的高、久不想的低、想起过很多次的降得慢——
+        # 上游用 activation_count^0.3 × e^(-λ·days) × 36h 新鲜度三个参数拼的，这里一个式子。
+        # 再乘独特性：被同一条要义盖住的一簇事件，每条 1/√(1+同簇条数)——第三十七次泡碗
+        # 已经活在要义里，单独留着没意义；独一无二的事三个月不衰（rule.md 1：只降可见性）。
+        self.model = str(decay_cfg.get("model") or "ebbinghaus").strip().lower()
+        self.recall_log = str(decay_cfg.get("recall_log") or "")
+        self.gist_ledger = str(decay_cfg.get("gist_ledger") or "")
+        try:
+            self.actr_d = float(decay_cfg.get("actr_d", _ACTR_D))
+        except (TypeError, ValueError):
+            self.actr_d = _ACTR_D
+        self._recall_cache = {"mtime": None, "times": {}}
+        self._coverage_cache = {"mtime": None, "at": 0.0, "ledger": {}, "buckets": {}}
 
         # --- Background task control / 后台任务控制 ---
         self._task: asyncio.Task | None = None
@@ -269,7 +296,119 @@ class DecayEngine:
             else 1.0
         )
 
+        if self.model == "actr":
+            return round(
+                self._actr_score(metadata, importance, emotion_weight, resolved, digested, urgency_boost),
+                4,
+            )
         return round(base_score * resolved_factor * urgency_boost, 4)
+
+    # ---------------------------------------------------------
+    # ACT-R 基础激活 × 独特性
+    # ---------------------------------------------------------
+    def _actr_score(self, meta: dict, importance: int, emotion_weight: float,
+                    resolved: bool, digested: bool, urgency_boost: float) -> float:
+        bucket_id = str(meta.get("id") or "")
+        now = datetime.now()
+        times: list[float] = []
+        for field in ("created", "last_active"):
+            try:
+                t = parse_iso_datetime(meta.get(field) or "")
+                days = max(0.0, (now - t).total_seconds() / _SECONDS_PER_DAY)
+            except (ValueError, TypeError):
+                continue
+            if field == "last_active" and times and abs(days - times[0]) < 0.01:
+                continue   # last_active == created：不是一次强化
+            times.append(days)
+        if not times:
+            times = [float(_DEFAULT_DAYS_FALLBACK)]
+        times.extend(self._recall_days(bucket_id, now))
+        base = sum(max(t, _ACTR_MIN_DAYS) ** (-self.actr_d) for t in times)
+        distinct = self._distinctiveness(bucket_id)
+        if resolved and digested:
+            factor = _ACTR_RESOLVED_DIGESTED
+        elif resolved:
+            factor = _ACTR_RESOLVED_FACTOR
+        else:
+            factor = 1.0
+        return importance * base * emotion_weight * distinct * factor * urgency_boost
+
+    def _recall_days(self, bucket_id: str, now: datetime) -> list[float]:
+        """想起史：recall_log（cuefield 的 recalls.jsonl，每行 {at, recalled:[{id}]}）里这条被想起的时刻。"""
+        path = self.recall_log
+        if not path or not bucket_id:
+            return []
+        try:
+            mtime = (os.path.getmtime(path), os.path.getsize(path))
+        except OSError:
+            return []
+        cache = self._recall_cache
+        # 键带上大小：同一个 jiffy 里连写两次 mtime 可能一样（测试里真撞上了）
+        if cache["mtime"] != mtime:
+            times: dict[str, list[datetime]] = {}
+            try:
+                with io.open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            row = json.loads(line)
+                            at = datetime.fromisoformat(str(row.get("at"))[:19])
+                        except Exception:
+                            continue
+                        for r in row.get("recalled") or []:
+                            rid = str((r or {}).get("id") or "")
+                            if rid:
+                                times.setdefault(rid, []).append(at)
+            except OSError:
+                times = {}
+            cache["mtime"], cache["times"] = mtime, times
+        return [max(0.0, (now - t).total_seconds() / _SECONDS_PER_DAY) for t in cache["times"].get(bucket_id, [])]
+
+    def _distinctiveness(self, bucket_id: str) -> float:
+        """1/√(1+n)，n = 和它被同一条要义盖住的其它事件数。没被盖住 = 1。"""
+        if not bucket_id:
+            return 1.0
+        cov = self._coverage()
+        n = cov.get(bucket_id, 0)
+        return 1.0 / math.sqrt(1.0 + float(n)) if n > 0 else 1.0
+
+    def _coverage(self) -> dict:
+        """{事件 id: 同簇其它事件数}。两个来源合并：影子账本 gists.json、type=gist 的桶（links.sources）。"""
+        cache = self._coverage_cache
+        path = self.gist_ledger
+        mtime = None
+        if path:
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = None
+        if mtime is not None and cache["mtime"] != mtime:
+            ledger: dict[str, int] = {}
+            try:
+                data = json.loads(io.open(path, encoding="utf-8").read())
+                for g in data.get("gists") or []:
+                    srcs = [str(x) for x in (g.get("sources") or [])]
+                    for sid in srcs:
+                        ledger[sid] = max(ledger.get(sid, 0), len(srcs) - 1)
+            except Exception:
+                ledger = {}
+            cache["mtime"], cache["ledger"] = mtime, ledger
+        merged = dict(cache["buckets"])
+        for k, v in cache["ledger"].items():
+            merged[k] = max(merged.get(k, 0), v)
+        return merged
+
+    def note_gist_buckets(self, buckets: list) -> None:
+        """衰减周期开头调一次：从 type=gist 的桶读 links.sources，更新覆盖表。"""
+        cov: dict[str, int] = {}
+        for b in buckets or []:
+            meta = (b or {}).get("metadata") or {}
+            if str(meta.get("type") or "") != "gist":
+                continue
+            links = meta.get("links") or {}
+            srcs = [str(x) for x in (links.get("sources") or [])] if isinstance(links, dict) else []
+            for sid in srcs:
+                cov[sid] = max(cov.get(sid, 0), len(srcs) - 1)
+        self._coverage_cache["buckets"] = cov
 
     # ---------------------------------------------------------
     # Execute one decay cycle
@@ -295,6 +434,10 @@ class DecayEngine:
         archived = 0
         auto_resolved = 0
         lowest_score = float("inf")
+        try:
+            self.note_gist_buckets(buckets)
+        except Exception as e:
+            logger.warning(f"gist coverage scan failed / 要义覆盖表没算出来: {e}")
 
         demoted_orphans = 0
         for bucket in buckets:

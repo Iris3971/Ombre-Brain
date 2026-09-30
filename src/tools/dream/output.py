@@ -242,6 +242,7 @@ async def format_dream_output(
     connection_hint: str,
     crystal_hint: str,
     self_review: object | None = None,
+    extra_hints: list | None = None,
 ) -> str:
     runtime_config = rt.config if isinstance(rt.config, dict) else {}
     surfacing_cfg = runtime_config.get("surfacing", {}) or {}
@@ -535,7 +536,8 @@ async def format_dream_output(
         rt.logger.warning(f"Dream feel history failed: {e}")
 
     # --- ④/⑤ connection hint / crystal hint ---
-    for hint in (connection_hint, crystal_hint):
+    # extra_hints = [重放段, 当时的感觉]，跟两条 hint 一样只是材料，放不下就省略。
+    for hint in (connection_hint, crystal_hint, *(extra_hints or [])):
         if hint:
             append_fragment("\n" + hint)
 

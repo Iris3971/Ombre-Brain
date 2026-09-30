@@ -320,6 +320,7 @@ from utils import (
     parse_iso_datetime,
     publish_new_file,
 )
+from ombrebrain.storage.situation import normalize_cue, normalize_links, normalize_situation
 from ombrebrain.storage import bucket_paths as _bp
 from ombrebrain.storage import metadata_normalize as _mn
 from ombrebrain.storage.media_store import MediaStore
@@ -328,6 +329,7 @@ from ombrebrain.retrieval.bucket_scoring import (
     calc_emotion_score,
     calc_time_score,
     calc_touch_score,
+    passes_relevance_gate,
 )
 from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 from ombrebrain.eventsourcing.ledger_replay import LedgerReplayValidator
@@ -406,7 +408,8 @@ _DEFAULT_IMPORTANCE = 5
 _PINNED_IMPORTANCE = 10           # pinned/protected 桶 importance 锁定值
 _DEFAULT_DOMAIN_NAME = "未分类"     # 未提供 domain 时的占位
 _EDITABLE_BUCKET_TYPES = frozenset(
-    {"dynamic", "permanent", "feel", "plan", "letter", "i", "self"}
+    {"dynamic", "permanent", "feel", "plan", "letter", "i", "self",
+     "gist", "recollection"}  # 要义 / 回忆版本（hold(kind=...) 写完后 update(type=...)）
 )
 _PLAN_STATUSES = frozenset({"active", "resolved", "abandoned"})
 _ARCHIVED_LETTER_TERMINAL_VALUE_FIELDS = (
@@ -526,6 +529,18 @@ def _clamp01(value, default: float) -> float:
     return max(0.0, min(1.0, numeric))
 
 
+
+def _coerce_iso_ts(value):
+    """created / last_active 只收 ISO 时间：datetime 直接转，字符串要能被 fromisoformat 读；不合法就抛 ValueError（不静默）。"""
+    from datetime import datetime as _dt
+    if isinstance(value, _dt):
+        return value.isoformat(timespec="seconds")
+    text = str(value).strip()
+    _dt.fromisoformat(text.replace("Z", "+00:00"))
+    return text
+
+_PASSTHROUGH_TOOL_FIELDS = ("i_superseded_by", "i_disputed_by", "anchor_candidate", "breath_touch_count")
+
 class BucketManager:
     """
     Memory bucket manager — entry point for all bucket CRUD operations.
@@ -583,6 +598,21 @@ class BucketManager:
         self.w_semantic = scoring.get("semantic_weight", 2.5)
         # BM25: TF-IDF 加权关键词匹配（rank_bm25+jieba，软依赖）
         self.w_bm25 = scoring.get("bm25_weight", 1.5)
+        # 召回与排序分开（见 bucket_scoring.passes_relevance_gate）。默认关。
+        _matching = config.get("matching", {}) or {}
+        self.gate_rank_split = parse_bool(_matching.get("gate_rank_split"), default=False)
+        # 融合方式。weighted = 上游七维加权和；rrf = 各通道 top-K 取并集再 RRF。
+        # LoCoMo 400 题：加权和+重排 hit@5 0.70，纯向量+重排 0.76，rrf+重排 0.77——拖后腿的是加权和本身。
+        self.fusion = str(_matching.get("fusion") or "weighted").strip().lower()
+        try:
+            self.rrf_channel_k = int(_matching.get("rrf_channel_k", 30))
+        except (TypeError, ValueError):
+            self.rrf_channel_k = 30
+        try:
+            self.gate_topic = float(_matching.get("gate_topic", 0.6))
+            self.gate_bm25 = float(_matching.get("gate_bm25", 0.5))
+        except (TypeError, ValueError):
+            self.gate_topic, self.gate_bm25 = 0.6, 0.5
 
         # --- Optional embedding engine for pre-filtering / 可选 embedding 引擎，用于预筛候选集 ---
         self.embedding_engine = embedding_engine
@@ -1396,6 +1426,7 @@ class BucketManager:
         unlock_date: str | None = None,
         locked_by: str = "",
         writer_name: str = "",
+        created: Any = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -1475,7 +1506,7 @@ class BucketManager:
 
         # --- Build YAML frontmatter metadata / 构建元数据 ---
         # 越界不静默 clamp：会产生 OB-W001/OB-W002 提示走到 MCP 返回末尾
-        created_at = now_iso()
+        created_at = _coerce_iso_ts(created) if created else now_iso()   # 09-25：回填可以把桶记成那天
         metadata = {
             "id": bucket_id,
             "name": bucket_name,
@@ -2457,6 +2488,16 @@ class BucketManager:
             post["tags"] = kwargs["tags"]
         if "importance" in kwargs:
             post["importance"] = _clamp_importance(kwargs["importance"], f"update:{bucket_id}")
+        if "created" in kwargs:            # 09-25：以前这两个字段传进来被静默丢掉
+            post["created"] = _coerce_iso_ts(kwargs["created"])
+        if "last_active" in kwargs:
+            post["last_active"] = _coerce_iso_ts(kwargs["last_active"])
+        for _tool_field in _PASSTHROUGH_TOOL_FIELDS:   # 09-25：I 工具/衰减引擎传的键，以前静默丢
+            if _tool_field in kwargs:
+                if kwargs[_tool_field] is None or kwargs[_tool_field] == "":
+                    post.metadata.pop(_tool_field, None)
+                else:
+                    post[_tool_field] = kwargs[_tool_field]
         if "domain" in kwargs:
             post["domain"] = kwargs["domain"]
         if "valence" in kwargs:
@@ -2503,6 +2544,15 @@ class BucketManager:
                 post.metadata.pop("protected", None)
         if "digested" in kwargs:
             post["digested"] = kwargs["digested"]
+        # 情境指纹 / 要义与回忆版本的链接 / plan 的线索。只做形状收敛（白名单、限长），
+        # 业务含义在 ombrebrain/storage/situation.py。传空值 = 清掉。
+        for _field, _norm in (("situation", normalize_situation), ("links", normalize_links), ("cue", normalize_cue)):
+            if _field in kwargs:
+                _normalized = _norm(kwargs[_field])
+                if _normalized:
+                    post[_field] = _normalized
+                else:
+                    post.metadata.pop(_field, None)
         if "model_valence" in kwargs:
             post["model_valence"] = _clamp01(kwargs["model_valence"], _DEFAULT_VALENCE)
         if "media" in kwargs:
@@ -3434,6 +3484,7 @@ class BucketManager:
         # --- Layer 2: weighted multi-dim ranking ---
         # --- 第二层：多维加权精排 ---
         scored = []
+        _rrf_pool: dict = {}
         for bucket in candidates:
             meta = bucket.get("metadata", {})
 
@@ -3451,6 +3502,9 @@ class BucketManager:
 
                 # Dim 1: topic relevance (fuzzy text, 0~1)
                 topic_score = self._calc_topic_score(query, bucket)
+                if self.fusion == "rrf":
+                    _rrf_pool[bucket["id"]] = (topic_score, literal_hit, bucket)
+                    continue
 
                 # Dim 2: emotion resonance (coordinate distance, 0~1)
                 emotion_score = self._calc_emotion_score(
@@ -3523,7 +3577,16 @@ class BucketManager:
                 # 没有立刻改，是因为当前没有故障、且这是召回主路径；真要动需要先
                 # 攒一批带标准答案的查询（"我问了什么、期望返回什么"），否则无法
                 # 验证新门是不是把该召回的挡在了外面。见 docs/INTERNALS.md §3.1。
-                text_match = normalized >= self.fuzzy_threshold or literal_hit
+                if self.gate_rank_split:
+                    text_match = passes_relevance_gate(
+                        literal_hit=literal_hit, topic=topic_score,
+                        bm25=bm25_scores.get(bucket["id"], 0.0) if bm25_scores else 0.0,
+                        semantic=semantic_score,
+                        topic_threshold=self.gate_topic, bm25_threshold=self.gate_bm25,
+                        semantic_threshold=self.vector_recall_threshold,
+                    )
+                else:
+                    text_match = normalized >= self.fuzzy_threshold or literal_hit
                 semantic_match = (
                     semantic_score is not None
                     and semantic_score >= self.vector_recall_threshold
@@ -3546,8 +3609,46 @@ class BucketManager:
                 )
                 continue
 
+        if self.fusion == "rrf":
+            return self._rrf_rank(_rrf_pool, bm25_scores, vector_scores)[:limit]
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    def _rrf_rank(self, pool: dict, bm25_scores: dict, vector_scores: dict) -> list[dict]:
+        """候选 = 各通道 top-K 的并集（BM25 / 向量 / 字面命中 / 主题过门），分 = Σ 1/(60+rank)。
+        新不新、重不重要不进这里——那是浮现和衰减的事，不是「跟查询有没有关」的事。"""
+        K = max(1, self.rrf_channel_k)
+        lists = []
+        bm = [bid for bid, sc in sorted(bm25_scores.items(), key=lambda x: -x[1]) if bid in pool and sc > 0][:K]
+        vec = [bid for bid, sc in sorted(vector_scores.items(), key=lambda x: -x[1])
+               if bid in pool and sc >= self.vector_recall_threshold * 0.8][:K]
+        topic = [bid for bid, (t, lit, _) in sorted(pool.items(), key=lambda x: -x[1][0]) if t > 0][:K]
+        for lst in (bm, vec, topic):
+            if lst:
+                lists.append(lst)
+        allowed = set(bm) | set(vec) | {bid for bid, (t, lit, _) in pool.items() if lit or t >= self.gate_topic}
+        fused: dict[str, float] = {}
+        for lst in lists:
+            for r, bid in enumerate(lst):
+                if bid in allowed:
+                    fused[bid] = fused.get(bid, 0.0) + 1.0 / (60.0 + r + 1)
+        for bid, (t, lit, _) in pool.items():
+            if lit and bid in allowed:
+                fused[bid] = fused.get(bid, 0.0) + 1.0 / 61.0   # 字面命中当作一条通道的第一名
+        out = []
+        for bid, sc in sorted(fused.items(), key=lambda x: -x[1]):
+            _, lit, bucket = pool[bid]
+            meta = bucket.get("metadata", {})
+            score = sc * 100.0
+            if meta.get("resolved", False):
+                score *= _RESOLVED_RANK_PENALTY
+            bucket["score"] = round(score, 2)
+            if bid in set(vec) and bid not in set(bm) and not lit:
+                bucket["vector_match"] = True
+            else:
+                bucket.pop("vector_match", None)
+            out.append(bucket)
+        return out
 
     # ---------------------------------------------------------
     # 四个评分维度的纯函数实现已拆到 ombrebrain.retrieval.bucket_scoring；这里保留同名

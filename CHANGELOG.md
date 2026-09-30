@@ -2,6 +2,46 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 未发布（testing 分支）
+
+> 从一个长期运行的实例里提出来的通用改动。全部默认关或行为不变，开关都在 config.example.yaml 里有注释。
+> 下面的读数来自该实例的 LoCoMo / LongMemEval 跑分（同一读者、同一判卷），只供方向参考，不是可比的榜。
+
+### 检索 / Retrieval
+
+- **多通道融合可选 RRF**（`matching.fusion: rrf`，默认 `weighted` 不变）：BM25 / 向量 / 字面 / 主题各取 top-K 并集再
+  Reciprocal Rank Fusion。实例上 LongMemEval hit@5 0.76→0.90，LoCoMo 0.55→0.77。
+- **交叉重排**（`retrieval.rerank`，默认关）：命中再过一遍 reranker（OpenAI 兼容 rerank 端点，复用 embedding 的
+  base_url/key），只改顺序，失败原序返回。
+- **一跳扩展**（`retrieval.hop`，默认关）：命中旁边的（前后 / 同实体 / 已有链接）也进池子再排。
+- **同款折叠**（`retrieval.collapse_covered`，默认关）：被同一条要义盖住的命中只留 keep 条，要义顶前面。
+- **命中带日期**（`retrieval.surface_created`，默认关）：命中头部加 `[YYYY-MM-DD 周x]`。弱读者上 LongMemEval 0.64→0.80。
+- `surfacing.search_max_results`：带 query 的检索单独一个默认条数（0 = 同 breath_max_results）。
+- `matching.automatic_hides_core`（默认关）：mode=automatic 的召回不返回 pinned/permanent（它们每轮已在场）。
+- breath_search 认桶的 `no_drift` 标记：技术备忘不参与随机浮现。
+
+### 浮现 / Surfacing
+
+- **那天的今天**（`surfacing.anniversary_slots`，默认 0）：无 query 浮现末尾单独一段，放创建日与今天同日（≥25 天前）的桶。
+- **心情一致**（`surfacing.mood_weight`，默认 0）：breath_advanced 不带 query 时 valence/arousal 当此刻心情，只给排序乘一个靠近度系数。
+
+### 写入 / Write side
+
+- `update()` 现在真的落 `situation` / `links` / `cue` 三个字段（此前被静默丢掉），并透传 `created` / `last_active` /
+  `i_superseded_by` / `i_disputed_by` / `anchor`；`create()` 接受 `created`。
+- 桶类型多了 `gist` / `recollection`（要义 / 回忆版本）。
+- **情境指纹**（`situation`，默认关）：hold/plan 没显式给 context 时从配置的文件读「此刻」写进桶。
+
+### 衰减与做梦 / Decay & Dream
+
+- `decay.model: actr`（默认 `ebbinghaus` 不变）：ACT-R 基础激活（想起史 × 独特性），`actr_d` / `recall_log` / `gist_ledger` 可配。
+- `dream.replay_slots`（默认 0）：给最近的事配更早的旧事摆在一起；`dream.feel_prompt`（默认关）：对动静大的事只摆一个问题。
+- I 候选：正文一样的念头不再写第二份。
+
+### 服务 / Server
+
+- `mcp.instructions`：握手时交给客户端的说明（MCP instructions 字段），设了才带。
+
 ## 3.6.14
 
 > 三条上游反馈。没有新功能——内存那条加的是读数，不是能力。

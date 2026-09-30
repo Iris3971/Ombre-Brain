@@ -61,6 +61,11 @@ _RECENT_SLOTS_DEFAULT = 3
 _RECENT_WINDOW_DAYS = 7
 # 3.6.0 久未浮现的新桶护栏：见 passive association 段。
 _PASSIVE_MIN_AGE_HOURS = 24
+# 「那天的今天」——创建日期和今天同日（至少一个月前）的桶，单独一段。
+_ANNIVERSARY_SLOTS_DEFAULT = 1
+_ANNIVERSARY_MIN_AGE_DAYS = 25
+# 心情一致的回忆。此刻的 valence/arousal 只给排序乘一个靠近度系数。
+_MOOD_WEIGHT_DEFAULT = 0.3
 _PIN_BUDGET_NOTICE = (
     "token 预算不足：核心准则 required≈{required} tokens（完整渲染核心准则总计），"
     "limit={limit} tokens，omitted={omitted} 条没能返回。"
@@ -209,12 +214,32 @@ async def surface_plans(max_tokens: int) -> str:
         return "读取 plan 失败。"
 
 
+def _mood_factor(meta: dict, mood_v: float, mood_a: float, weight: float) -> float:
+    """这条记忆的情绪坐标离此刻心情多近。1.0～1+weight，只用于排序。"""
+    try:
+        bv = float(meta.get("valence", 0.5)); ba = float(meta.get("arousal", 0.3))
+    except (TypeError, ValueError):
+        bv, ba = 0.5, 0.3
+    dist = 0.7 * abs(bv - mood_v) + 0.3 * abs(ba - mood_a)      # 0～1
+    return 1.0 + weight * (1.0 - min(1.0, dist))
+
+
+def _is_anniversary(bucket: dict, today: datetime) -> bool:
+    """创建日期的「日」和今天一样，且至少 _ANNIVERSARY_MIN_AGE_DAYS 天前。"""
+    created = _created_at(bucket)
+    if created is None or created.day != today.day:
+        return False
+    return (today - created).days >= _ANNIVERSARY_MIN_AGE_DAYS
+
+
 async def surface_default(
     max_results: int,
     max_tokens: int,
     tag_filter: list,
     created_from: "datetime | None" = None,
     created_to: "datetime | None" = None,
+    mood_valence: float = -1,
+    mood_arousal: float = -1,
 ) -> str:
     try:
         all_buckets = await rt.bucket_mgr.list_all(include_archive=False)
@@ -299,6 +324,19 @@ async def surface_default(
         f"{len(pinned_buckets)} pinned, {len(unresolved)} unresolved"
     )
 
+    # 心情一致。两个坐标都在 0~1 才算给了心情；weight=0 等于关掉。
+    try:
+        mood_weight = float(surfacing_cfg.get("mood_weight", _MOOD_WEIGHT_DEFAULT))
+    except (TypeError, ValueError):
+        mood_weight = _MOOD_WEIGHT_DEFAULT
+    mood_on = (
+        mood_weight > 0
+        and 0.0 <= float(mood_valence) <= 1.0
+        and 0.0 <= float(mood_arousal) <= 1.0
+    )
+    if mood_on:
+        rt.logger.info(f"mood-congruent surfacing: v={mood_valence:.2f} a={mood_arousal:.2f} w={mood_weight}")
+
 
     def _sort_key(b: dict):
         """F-05: 二级排序 key，消除同分时浮现随机抖动。
@@ -309,6 +347,8 @@ async def surface_default(
         """
         meta = b["metadata"]
         score = rt.decay_engine.calculate_score(meta)
+        if mood_on:
+            score = score * _mood_factor(meta, mood_valence, mood_arousal, mood_weight)
         try:
             last_ts = parse_iso_datetime(
                 meta.get("last_active") or meta.get("created", "")
@@ -504,6 +544,37 @@ async def surface_default(
     except Exception as e:
         rt.logger.warning(f"passive association block failed: {e}")
 
+    # --- 那天的今天 ---
+    # 人翻日历会想起"一个月前的今天"。独立一段，不占权重榜的位子，也不改任何分数。
+    anniversary_results: list[str] = []
+    try:
+        try:
+            anniv_slots = int(surfacing_cfg.get("anniversary_slots", _ANNIVERSARY_SLOTS_DEFAULT))
+        except (TypeError, ValueError):
+            anniv_slots = _ANNIVERSARY_SLOTS_DEFAULT
+        if anniv_slots > 0 and not dynamic_omitted:
+            today = datetime.now()
+            shown = {b["id"] for b in candidates}
+            pool = [b for b in unresolved if b["id"] not in shown and _is_anniversary(b, today)]
+            pool.sort(key=lambda b: rt.decay_engine.calculate_score(b["metadata"]), reverse=True)
+            for b in pool[:anniv_slots]:
+                try:
+                    created = _created_at(b)
+                    when = created.strftime("%m月%d日") if created else "那天"
+                    rendered, entry_tokens = render_stored_bucket(
+                        b,
+                        f"📅 [那天的今天·{when}] [bucket_id:{b['id']}]",
+                        _footprint(b),
+                    )
+                    if entry_tokens > token_budget:
+                        continue
+                    anniversary_results.append(rendered)
+                    token_budget -= entry_tokens
+                except Exception as e:
+                    rt.logger.warning(f"anniversary render failed: {e}")
+    except Exception as e:
+        rt.logger.warning(f"anniversary block failed: {e}")
+
     # --- 3% 偶遇：从 resolved 池随机浮现 1~3 条沉底记忆 (iter 2.1) ---
     # 设计意图：让已解决的记忆有小概率重新出现，制造"忽然想起"的温度。
     # 与无结果兜底逻辑并存；不替换主流程。
@@ -551,6 +622,8 @@ async def surface_default(
         parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
     if passive_results:
         parts.append("=== 久未浮现 ===\n" + "\n---\n".join(passive_results))
+    if anniversary_results:
+        parts.append("=== 那天的今天 ===\n" + "\n---\n".join(anniversary_results))
     if dream_results:
         parts.append("=== 偶然想起 ===\n" + "\n---\n".join(dream_results))
     if pinned_omitted:
