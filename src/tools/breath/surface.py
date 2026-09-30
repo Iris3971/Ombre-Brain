@@ -217,7 +217,8 @@ async def surface_plans(max_tokens: int) -> str:
 def _mood_factor(meta: dict, mood_v: float, mood_a: float, weight: float) -> float:
     """这条记忆的情绪坐标离此刻心情多近。1.0～1+weight，只用于排序。"""
     try:
-        bv = float(meta.get("valence", 0.5)); ba = float(meta.get("arousal", 0.3))
+        bv = float(meta.get("valence", 0.5))
+        ba = float(meta.get("arousal", 0.3))
     except (TypeError, ValueError):
         bv, ba = 0.5, 0.3
     dist = 0.7 * abs(bv - mood_v) + 0.3 * abs(ba - mood_a)      # 0～1

@@ -26,7 +26,7 @@ KEYS = ("date", "hour", "weekday", "place", "weather", "present", "activity", "b
 _MAX_TEXT = 40
 _MAX_NAME = 25
 _MAX_PRESENT = 5
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f‪-‮⁦-⁩]")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066-\u2069]")
 
 
 def _clean(text: object) -> str:

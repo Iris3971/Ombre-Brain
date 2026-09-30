@@ -332,7 +332,7 @@ async def build_replay_hint(recent: list, all_buckets: list) -> str:
     engine = rt.embedding_engine
     if not (engine and getattr(engine, "enabled", False)):
         return ""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from ombrebrain.policy.surfacing import SurfacePolicyVM
     from utils import parse_iso_datetime
     policy = SurfacePolicyVM.default()

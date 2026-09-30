@@ -10,7 +10,7 @@ def _resolve(surfacing, query, max_results):
     src = inspect.getsource(B.dispatch)
     m = re.search(r"    default_results = .*?    max_results = min\(max_results, 50\)\n", src, re.S)
     assert m, "找不到条数解析段"
-    body = "\n".join(l[4:] for l in m.group(0).splitlines())
+    body = "\n".join(ln[4:] for ln in m.group(0).splitlines())
     ns = {"surfacing_cfg": surfacing, "query": query, "max_results": max_results, "max_tokens": 0}
     exec(body, ns)
     return ns["max_results"]
