@@ -42,6 +42,15 @@
 
 - `mcp.instructions`：握手时交给客户端的说明（MCP instructions 字段），设了才带。
 
+### 依赖 / Dependencies
+
+- **pyjwt 2.13.0 → 2.14.0**：pip-audit 报十个 CVE（CVE-2026-102265 等），2.13.0 无修复版本。2.14.0 发布于
+  2026-09-11，晚于 CI 锁校验的包索引快照（2026-08-01），所以把 `UV_EXCLUDE_NEWER` 推进到 2026-09-12 并
+  重新生成两份锁。这是一次和 2026-08-09 同类的明确接受的破坏性变更：发布锁动了 31 个包，含
+  **openai 2.52.0 → 3.13.0（大版本）**、mcp 1.29.0 → 1.30.0、starlette 1.3.1 → 1.6.0、sse-starlette、
+  pydantic-settings 等；tqdm / distro / colorama 退出，httpx2 系列进来。旧更新器会判「依赖变了」并触发
+  一次依赖安装；v2.8.4 之前的实例可能需要手动升级一次。基线哈希已推进（tests/test_update_source_gate.py）。
+
 ## 3.6.14
 
 > 三条上游反馈。没有新功能——内存那条加的是读数，不是能力。
