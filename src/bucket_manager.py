@@ -3155,19 +3155,14 @@ class BucketManager:
             post["tombstoned_at"] = tombstone_at
             post["erasure_mode"] = "tombstone_only"
             os.makedirs(self.archive_dir, exist_ok=True)
-            dest = os.path.join(self.archive_dir, os.path.basename(file_path))
-            # 若 archive/ 里已有同名文件（极罕见），追加 bucket_id 后缀避免覆盖
-            if os.path.exists(dest) and dest != file_path:
-                dest = os.path.join(
-                    self.archive_dir,
-                    f"{os.path.splitext(os.path.basename(file_path))[0]}_{bucket_id}.md",
-                )
+            # 若 archive/ 里已有同名文件（极罕见），换一个不冲突的名字，绝不覆盖
+            dest = self._free_archive_target(self.archive_dir, file_path, bucket_id)
             self._commit_bucket_update(
                 file_path,
                 str(dest),
                 frontmatter.dumps(post),
             )
-        except OSError as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Failed to soft-delete bucket / 软删除桶文件失败: {file_path}: {e}")
             return False
 
@@ -3932,6 +3927,67 @@ class BucketManager:
         async with self._bucket_turn(bucket_id):
             return await self._archive_locked(bucket_id)
 
+    # 撞名兜底最多试到 {名}_999_{id}.md；全被占就放弃本次归档（安全失败）
+    _ARCHIVE_NAME_MAX_SEQ = 999
+
+    def _free_archive_target(self, target_dir: str, file_path: str, bucket_id: str) -> Path:
+        """为归档/软删除挑一个不会覆盖任何已有文件的目标路径。
+
+        - 第一候选就是原文件名，普通归档的文件名和以前完全一样。
+        - 撞名时不再对原名直接追加 ``_{id}``：管理器建的桶文件名本来就以
+          ``_{id}`` 结尾，再拼一次就成了 ``_{id}_{id}``；而且只有这一个兜底，
+          它也被占时归档永远失败，衰减每轮重试、活跃副本一直留着（#118）。
+          所以先剥掉结尾所有重复的 ``_{id}``（存量双拼名以后也会归一），
+          再依次试 ``{名}_{id}.md``、``{名}_2_{id}.md`` ……
+        - 编号插在 id 前面，保证文件名始终以 ``_{id}`` 结尾，
+          ``_find_bucket_file`` 按文件名走的快路径照样能找到。
+        - 永不覆盖、永不删除已有归档（rule.md 第 1 条：记忆绝不能被抹去）；
+          ``_commit_bucket_update`` 的存在检查仍是最后一道防线。
+        """
+        basename = os.path.basename(file_path)
+        dest = safe_path(target_dir, basename)
+        if not os.path.exists(dest) or self._same_path(str(dest), file_path):
+            return dest
+
+        self._warn_if_same_bucket_copy(str(dest), file_path, bucket_id)
+
+        suffix = f"_{bucket_id}"
+        core = os.path.splitext(basename)[0]
+        while core.endswith(suffix):
+            core = core[: -len(suffix)]
+        if core == bucket_id:
+            core = ""
+
+        first = f"{core}{suffix}.md" if core else f"{bucket_id}.md"
+        candidates = [first]
+        for k in range(2, self._ARCHIVE_NAME_MAX_SEQ + 1):
+            candidates.append(f"{core}_{k}{suffix}.md" if core else f"{k}{suffix}.md")
+        for name in candidates:
+            cand = safe_path(target_dir, name)
+            if not os.path.exists(cand):
+                return cand
+        raise FileExistsError(
+            f"no free archive target for bucket {bucket_id} in {target_dir}"
+        )
+
+    @staticmethod
+    def _warn_if_same_bucket_copy(existing: str, file_path: str, bucket_id: str) -> None:
+        """占位的已有文件若是同一个桶的另一份物理副本，记一条告警（只记，不处理）。"""
+        try:
+            existing_id = str(frontmatter.load(existing).get("id") or "")
+        except Exception:
+            return
+        if existing_id != bucket_id:
+            return
+        logger.warning(
+            "Bucket %s already has another physical copy; archiving under a new "
+            "name, nothing is deleted / 同一桶已有多份物理副本，本次改名归档，"
+            "不删除任何一份: existing=%s source=%s",
+            bucket_id,
+            existing,
+            file_path,
+        )
+
     async def _archive_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -3945,12 +4001,9 @@ class BucketManager:
             archive_subdir = os.path.join(self.archive_dir, primary_domain)
             os.makedirs(archive_subdir, exist_ok=True)
 
-            dest = safe_path(archive_subdir, os.path.basename(file_path))
-            # 防撞名：archive/ 里已有同名文件时，追加 bucket_id 后缀，避免
-            # 把一条早先归档的记忆悄悄覆盖掉（与 delete() 的软删除保护一致）。
-            if os.path.exists(dest) and os.path.abspath(dest) != os.path.abspath(file_path):
-                stem = os.path.splitext(os.path.basename(file_path))[0]
-                dest = safe_path(archive_subdir, f"{stem}_{bucket_id}.md")
+            # 防撞名：archive/ 里已有同名文件时换一个不冲突的名字，避免把一条
+            # 早先归档的记忆悄悄覆盖掉（与 delete() 的软删除保护一致）。
+            dest = self._free_archive_target(archive_subdir, file_path, bucket_id)
 
             # Commit the archived metadata at the destination before removing
             # the untouched source.  A failed move must not leave an
