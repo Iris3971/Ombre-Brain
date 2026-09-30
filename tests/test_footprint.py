@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import frontmatter
 import pytest
 
 from errors import ToolInputError
@@ -154,6 +155,41 @@ async def test_trace_restore_archived_pin_does_not_silently_repin(
     assert active["metadata"].get("pinned", False) is False
     assert await count_pinned() == 0
     assert bucket_mgr.footprint_snapshot().summary(bucket_id).endswith("重新回忆")
+
+
+@pytest.mark.asyncio
+async def test_trace_restore_refreshes_last_active_so_next_decay_keeps_it(
+    bucket_mgr,
+    decay_eng,
+):
+    # 衰减归档 → 显式恢复 → 下一轮衰减不应立即再次归档（#82）
+    stale = "2026-01-01T00:00:00+00:00"
+    bucket_id = await bucket_mgr.create(
+        content="An old memory brought back on purpose.",
+        domain=["life"],
+        importance=5,
+    )
+    active_path = Path((await bucket_mgr.get(bucket_id))["path"])
+    post = frontmatter.load(active_path)
+    post["created"] = stale
+    post["last_active"] = stale
+    active_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    _install_runtime(bucket_mgr, decay_eng)
+
+    await decay_eng.run_decay_cycle()
+    archived = await bucket_mgr.get_including_archive(bucket_id)
+    assert archived["metadata"]["type"] == "archived"
+
+    restored = await trace_core(bucket_id, restore=True)
+    active = await bucket_mgr.get(bucket_id)
+
+    assert restored == f"已重新回忆并恢复记忆桶: {bucket_id}"
+    assert active["metadata"]["type"] == "dynamic"
+    assert active["metadata"]["last_active"] != stale
+
+    await decay_eng.run_decay_cycle()
+    after = await bucket_mgr.get(bucket_id)
+    assert after["metadata"]["type"] == "dynamic"
 
 
 def test_footprint_records_declared_source_and_pin_actors():
