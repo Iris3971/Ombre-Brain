@@ -33,6 +33,7 @@ from ombrebrain.storage.situation import normalize_kind, normalize_links, situat
 
 from .. import _runtime as rt
 from .._common import (
+    _push_warning_safe,
     check_content_size,
     check_metadata_size,
     enforce_pinned_quota,
@@ -159,10 +160,13 @@ async def dispatch(
         raise ToolInputError("测试数据不能创建为 pinned 或 feel；请使用普通测试桶。")
     if feel and explicit_domain:
         raise ToolInputError("feel 的 domain 固定为 feel，不能显式覆盖。")
+    raw_importance = importance
+    importance_unparsable = False
     try:
         importance = int(importance)
     except (TypeError, ValueError, OverflowError):
         importance = 5
+        importance_unparsable = True
     try:
         valence = float(valence)
     except (TypeError, ValueError, OverflowError):
@@ -207,13 +211,26 @@ async def dispatch(
     if err:
         raise ToolInputError(err)
 
-    # importance 越界 clamp 由 bucket_manager 接管（OB-W001 自动 push 到 channel）；
-    # 这里仅做一次软 clamp 便于配额判断。
+    # 这里先 clamp 到 [1,10]，bucket_manager 收到的已是合法值，它那边的 OB-W001
+    # 不会再触发；越界提示因此由本入口在下面补发，落盘值仍是 clamp 后的值。
+    importance_out_of_range = not 1 <= importance <= 10
     importance = max(1, min(10, importance))
 
     # pinned 配额检查（OB-W004 软警告 / OB-I002 自动退出）
     if pinned and not feel:
         pinned = await enforce_pinned_quota(True)
+
+    # feel 固定 importance=5、pinned 固定 10，传入值本来就不用，不提示。
+    if not feel and not pinned:
+        if importance_unparsable:
+            _push_warning_safe(
+                "OB-W001", f"importance={raw_importance!r} 无法解析，回退为 5（hold）"
+            )
+        elif importance_out_of_range:
+            _push_warning_safe(
+                "OB-W001",
+                f"importance={raw_importance!r} 超出 [1,10]，已修正为 {importance}（hold）",
+            )
 
     # 普通桶的 importance 配额在 merge_or_create 的最终 merge/create
     # 事务内检查；这里预检查会在“合并到已占位桶”时产生假降级提示。

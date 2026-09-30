@@ -170,6 +170,10 @@ async def trace_core(
     dont_surface = _safe_int(dont_surface, -1)
     if protected not in (-1, 0, 1):
         raise ToolInputError("protected 只能传 -1、0 或 1；本次未修改。")
+    # -1 是「不改」；其余越界值以前会被静默丢弃、其他字段照改，调用方
+    # 不知道 importance 没生效。和 protected 越界一样整体拒收。
+    if importance != -1 and not 1 <= importance <= 10:
+        raise ToolInputError("importance 只能传 -1（不改）或 1..10；本次未修改。")
 
     metadata_err = check_metadata_size(
         bucket_id=bucket_id,
