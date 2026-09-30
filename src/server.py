@@ -34,8 +34,9 @@ import logging
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from typing import Optional, Awaitable
+from typing import Annotated, Optional, Awaitable
 import httpx
+from pydantic import BeforeValidator
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -692,6 +693,21 @@ _tools_runtime.init(
 )
 
 
+# 纯数字桶 id 的入口兜底。
+# 桶 id 是 12 位 hex，约 0.36% 恰好全是数字；客户端把它序列化成 JSON 数字时，
+# pydantic v2 即使在 lax 模式下也不会把 int 转成 str，调用会在进 core 之前被拒。
+# 这里只把 int 转回字符串：bool 和 float 不转（仍按原样被拒，避免 1.5e11 之类
+# 被当成 id）。BeforeValidator 只作用于运行时校验器，对外 schema 仍是 string。
+def _numeric_id_to_str(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return value
+
+
+_BucketIdArg = Annotated[str, BeforeValidator(_numeric_id_to_str)]
+_OptBucketIdArg = Annotated[Optional[str], BeforeValidator(_numeric_id_to_str)]
+
+
 # =============================================================
 # MCP tools — thin registration wrappers
 # MCP 工具 —— 仅注册，实现见 tools/<tool>/
@@ -831,7 +847,7 @@ async def hold(
     importance: Optional[int] = 5,
     pinned: Optional[bool] = False,
     feel: Optional[bool] = False,
-    source_bucket: Optional[str] = "",
+    source_bucket: _OptBucketIdArg = "",
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
@@ -914,7 +930,7 @@ async def _decide_deletion_request(
 
 @mcp.tool()
 async def trace(
-    bucket_id: str,
+    bucket_id: _BucketIdArg,
     name: Optional[str] = "",
     title: Optional[str] = "",
     domain: Optional[str] = "",
@@ -941,11 +957,11 @@ async def trace(
     restore: Optional[bool] = False,
     old_str: Optional[str] = "",
     new_str: Optional[str] = None,
-    deletion_request_id: Optional[str] = "",
+    deletion_request_id: _OptBucketIdArg = "",
     deletion_decision: Optional[str] = "",
     deletion_ai_reason: Optional[str] = "",
-    unlink: Optional[str] = "",
-    relink: Optional[str] = "",
+    unlink: _OptBucketIdArg = "",
+    relink: _OptBucketIdArg = "",
     relation_type: Optional[str] = "",
     quotes_replace: Optional[list] = None,
     reinforce: Optional[bool] = False,
@@ -1108,7 +1124,7 @@ async def dream(
 
 
 @mcp.tool()
-async def anchor(bucket_id: str) -> str:
+async def anchor(bucket_id: _BucketIdArg) -> str:
     """把指定桶标记为 anchor(坐标系)。anchor 不主动出现在默认 breath，但 query/domain/emotion 命中时仍返回。硬上限 24，已满时拒绝并提示先 release。"""
     return await _with_notice(
         _t_anchor.anchor_set(bucket_id),
@@ -1118,7 +1134,7 @@ async def anchor(bucket_id: str) -> str:
 
 
 @mcp.tool()
-async def release(bucket_id: str) -> str:
+async def release(bucket_id: _BucketIdArg) -> str:
     """解除指定桶的 anchor 标记。桶恢复为普通状态，重新参与默认 breath；pinned 状态保留。"""
     return await _with_notice(
         _t_anchor.anchor_release(bucket_id),
@@ -1141,7 +1157,7 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
 async def plan(
     content: str,
     status: Optional[str] = "active",
-    related_bucket: Optional[str] = "",
+    related_bucket: _OptBucketIdArg = "",
     weight: Optional[float] = 0.5,
     why_remembered: Optional[str] = "",
 ) -> str:
@@ -1205,7 +1221,7 @@ user_name 可选;ai_name 可选(默认取环境变量 AI_NAME,回退 \"AI\");tit
 
 @mcp.tool()
 async def letter_lock_update(
-    letter_id: str,
+    letter_id: _BucketIdArg,
     lock_type: str,
     unlock_date: Optional[str] = "",
 ) -> str:
@@ -1274,8 +1290,8 @@ async def I(
     aspect: Optional[str] = "",
     read: Optional[bool] = False,
     limit: Optional[int] = 20,
-    promote: Optional[str] = "",
-    supersedes: Optional[str] = "",
+    promote: _OptBucketIdArg = "",
+    supersedes: _OptBucketIdArg = "",
 ) -> str:
     """写下或读取自我认知。I 是沉淀物不是日记：content=一个「我觉得……」，先落成一条普通记忆（候选），会浮现也会衰减，每次 dream 都跟相关记忆摆在一起碰撞。aspect=维度:nature(本质)/values(看重的)/patterns(规律)/limits(局限)/becoming(变化方向)/uncertainty(不确定的)/stance(立场)(可选)。read=True 或全空=读正式条目+待沉淀候选。limit=返回条数上限(默认 20)。promote=候选桶ID，被 3 次不同日期的 dream 见证后才能升级成正式条目（可同时传 content 用提炼后的措辞）。supersedes=正式I条目ID，表示这条新认识要取代它：旧条目立刻不再作为当前信念读出去（一个字不删，随时可查，质疑撤了它就回来），而新的仍要照常攒够见证；只能在同一 aspect 内取代。正式条目不参与普通 breath/dream，SessionStart 时自动附最近 3 条。"""
     return await _with_notice(

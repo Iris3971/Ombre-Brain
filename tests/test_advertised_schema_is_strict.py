@@ -98,3 +98,64 @@ async def test_dynamic_you_them_tools_are_hardened_too():
             assert not _offenders(name, tool.parameters)
         finally:
             gate.sync(False)
+
+
+# 纯数字桶 id 经 JSON 序列化成 int：运行时要收成字符串，对外 schema 仍是 string。
+_NUMERIC_ID = 139690343292
+_ID_ARG_CASES = [
+    ("hold", "source_bucket", ("_t_hold", "dispatch", None), {"content": "x"}),
+    ("trace", "bucket_id", ("_t_trace", "dispatch", None), {}),
+    ("trace", "deletion_request_id", ("", "_decide_deletion_request", 1),
+     {"bucket_id": "b", "deletion_decision": "approve"}),
+    ("trace", "unlink", ("_t_trace", "dispatch", None), {"bucket_id": "b"}),
+    ("trace", "relink", ("_t_trace", "dispatch", None), {"bucket_id": "b"}),
+    ("anchor", "bucket_id", ("_t_anchor", "anchor_set", 0), {}),
+    ("release", "bucket_id", ("_t_anchor", "anchor_release", 0), {}),
+    ("plan", "related_bucket", ("_t_plan", "plan_create", None), {"content": "x"}),
+    ("letter_lock_update", "letter_id", ("_t_plan", "letter_lock_update", None),
+     {"lock_type": "none"}),
+    ("I", "promote", ("_t_i", "dispatch", None), {}),
+    ("I", "supersedes", ("_t_i", "dispatch", None), {}),
+]
+
+
+def _patch_target(monkeypatch, server, target, seen):
+    module_name, attr, _pos = target
+
+    async def fake(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return "ok"
+
+    owner = getattr(server, module_name) if module_name else server
+    monkeypatch.setattr(owner, attr, fake)
+
+
+def _seen_value(seen, param, target):
+    pos = target[2]
+    return seen["kwargs"][param] if pos is None else seen["args"][pos]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,param,target,required", _ID_ARG_CASES)
+async def test_numeric_bucket_id_is_accepted_as_string(
+    monkeypatch, tool_name, param, target, required
+):
+    import server
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    seen: dict = {}
+    _patch_target(monkeypatch, server, target, seen)
+    monkeypatch.setattr(server, "_log_op_entry", lambda *_a: None)
+    monkeypatch.setattr(server, "_log_op_ok", lambda *_a: None)
+    tool = server.mcp._tool_manager.get_tool(tool_name)
+
+    output = await tool.run({**required, param: _NUMERIC_ID})
+    assert output.startswith("ok")
+    assert _seen_value(seen, param, target) == str(_NUMERIC_ID)
+
+    listed = next(t for t in await server.mcp.list_tools() if t.name == tool_name)
+    assert listed.inputSchema["properties"][param]["type"] == "string"
+
+    with pytest.raises(ToolError):
+        await tool.run({**required, param: True})
