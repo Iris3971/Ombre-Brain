@@ -172,6 +172,8 @@ def test_manifest_rejects_non_object_items():
         ({"path": "src/server.py", "sha256": "not-a-digest", "size": 2}, "sha256"),
         ({"path": "src/server.py", "sha256": "a" * 64, "size": -1}, "大小"),
         ({"path": "src/server.py", "sha256": "a" * 64, "size": True}, "大小"),
+        ({"path": "src/server.py", "sha256": "a" * 63, "size": 2}, "sha256"),
+        ({"path": ["src/server.py"], "sha256": "a" * 64, "size": 2}, "无效路径"),
     ],
 )
 def test_manifest_requires_strict_size_and_sha256(entry, expected):

@@ -32,6 +32,7 @@ _import_lock = asyncio.Lock()
 
 
 def _is_reparse_point(info: os.stat_result) -> bool:
+    """Windows 上 lstat 结果带 reparse point 属性（junction 等）即为真；其他平台恒为假。"""
     return bool(
         getattr(info, "st_file_attributes", 0)
         & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -39,7 +40,7 @@ def _is_reparse_point(info: os.stat_result) -> bool:
 
 
 def _safe_rollback_member(name: str) -> tuple[str, ...]:
-    """Normalize one local-backup member or reject filesystem aliases."""
+    """把本地备份里的一个成员名规整成路径分段；凡是会在某个文件系统上变成别名的一律拒绝。"""
 
     raw = str(name or "")
     if not raw or "\x00" in raw:
@@ -62,19 +63,19 @@ def _safe_rollback_member(name: str) -> tuple[str, ...]:
 
 
 def _prepare_rollback_target(root: str, parts: tuple[str, ...]) -> str:
-    """Create regular parents and reject symlink/reparse traversal."""
+    """逐级建出普通目录作父目录；根目录以下任何一级是符号链接或 reparse point 都拒绝。"""
 
-    root_abs = os.path.abspath(root)
+    # 根目录是部署时配置的 buckets_dir，本身是符号链接/junction 的部署
+    # （例如把库放在别的盘）原来能回滚，这里先解析成真实路径再往下查，
+    # 和 storage/backup_archive 里 Path(buckets_dir).resolve() 的做法一致；
+    # 只有根目录以下的链接才算越界。
+    root_abs = os.path.realpath(root)
     try:
-        root_info = os.lstat(root_abs)
+        root_info = os.stat(root_abs)
     except OSError as exc:
         raise ValueError("恢复根目录不可读") from exc
-    if (
-        stat.S_ISLNK(root_info.st_mode)
-        or _is_reparse_point(root_info)
-        or not stat.S_ISDIR(root_info.st_mode)
-    ):
-        raise ValueError("恢复根目录不安全")
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("恢复根目录不是目录")
 
     parent = root_abs
     for part in parts[:-1]:
@@ -104,7 +105,7 @@ def _prepare_rollback_target(root: str, parts: tuple[str, ...]) -> str:
 
 
 def _restore_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, target: str) -> None:
-    """Stream one member to a sibling temp file, then atomically replace."""
+    """把一个成员分块写进同目录临时文件，核对长度并 fsync 后原子替换目标。"""
 
     parent = os.path.dirname(target)
     fd, temporary = tempfile.mkstemp(prefix=".ob-rollback-", dir=parent)
@@ -129,6 +130,7 @@ def _restore_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, target: str)
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
 
 try:
     from github_sync import GitHubSync  # type: ignore
@@ -226,8 +228,8 @@ def _rollback_from_backup(buckets_dir: str, backup_zip: str) -> dict:
                 except Exception as exc:
                     失败.append(f"{info.filename}: {exc}")
 
-            # A file cannot also be another member's parent.  Reject the
-            # platform-independent archive collision before creating parents.
+            # 一个成员不能既是文件、又是另一个成员的父目录；这种冲突与平台无关，
+            # 在建任何父目录之前就整包拒绝。
             for _info, parts in planned:
                 for index in range(1, len(parts)):
                     if "/".join(parts[:index]).casefold() in seen:

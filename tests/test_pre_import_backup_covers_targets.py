@@ -217,3 +217,50 @@ def test_后缀不安全时前缀安全成员也不先落盘(tmp_path):
     assert 结果["restored"] == 0
     assert not (tmp_path / "safe.md").exists()
     assert outside.read_bytes() == b"outside-original"
+
+
+def _目录链接(link, target):
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if os.name != "nt":
+        pytest.skip("当前宿主不允许创建目录符号链接")
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def test_恢复根目录本身是链接时照常还原(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "a.md").write_text("old", encoding="utf-8")
+    root = tmp_path / "linked-root"
+    _目录链接(root, real)
+    备份 = tmp_path / "backup.zip"
+    with zipfile.ZipFile(备份, "w") as z:
+        z.writestr("a.md", "backup")
+
+    结果 = _rollback_from_backup(str(root), str(备份))
+
+    assert 结果["ok"] is True
+    assert 结果["restored"] == 1
+    assert (real / "a.md").read_text(encoding="utf-8") == "backup"
+
+
+def test_备份不会穿过根目录以下的目录链接(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _目录链接(root / "jd", outside)
+    坏包 = tmp_path / "junction.zip"
+    with zipfile.ZipFile(坏包, "w") as z:
+        z.writestr("jd/escaped.md", "backup-content")
+
+    结果 = _rollback_from_backup(str(root), str(坏包))
+
+    assert 结果["ok"] is False
+    assert 结果["restored"] == 0
+    assert not (outside / "escaped.md").exists()
