@@ -57,6 +57,7 @@ try:
 except ImportError:  # pragma: no cover
     from ..utils import parse_bool  # type: ignore
 
+from ombrebrain.observability import process_memory
 from ombrebrain.storage.vault_health import inspect_vault
 
 _LOGS_DEFAULT_LIMIT = 200
@@ -1002,6 +1003,7 @@ async def build_system_diagnostics() -> dict[str, Any]:
     emb_outbox = sh.embedding_outbox
     emb_queue = emb_outbox.status() if emb_outbox is not None else None
     emb_pending = int((emb_queue or {}).get("pending") or 0)
+    emb_abandoned = int((emb_queue or {}).get("abandoned") or 0)
     emb_circuit = (emb_queue or {}).get("circuit") or {}
     if not emb_enabled_cfg:
         emb_status = "error"
@@ -1029,6 +1031,17 @@ async def build_system_diagnostics() -> dict[str, Any]:
             f"连续失败 {int(emb_circuit.get('consecutive_failures') or 0)} 次）"
         )
         emb_action = "检查网络/额度；恢复后点击“补齐缺失向量”可立即重试"
+    elif emb_abandoned:
+        emb_status = "warning"
+        emb_message = (
+            f"有 {emb_abandoned} 条向量在供应商正常时仍反复失败，已放弃重试；"
+            "记忆原文不受影响"
+            + (f"（另有 {emb_pending} 条待处理）" if emb_pending else "")
+        )
+        emb_action = (
+            "检查这些记忆的内容长度或 provider 限制；"
+            "修改内容或点击“补齐缺失向量”会重新尝试"
+        )
     elif emb_pending:
         emb_status = "warning"
         emb_message = (
@@ -1281,6 +1294,55 @@ async def build_system_diagnostics() -> dict[str, Any]:
             message,
             details=pinned_report,
             action=action,
+        ))
+
+    # 内存读数。上游报过 Render 512MB 上 OOM，而报告里只有「持续增长」——
+    # 没有 RSS、没有上限确认，照着那种描述改代码就是猜。把读数摆进诊断页，
+    # 下一次报告才带得上真实测量。容器上限走 cgroup 而不是 /proc/meminfo：
+    # 容器里后者报的是宿主机内存，照它算会得出「用了 2%」而进程正在被杀。
+    memory = process_memory.snapshot()
+    if not memory.get("available"):
+        checks.append(_check(
+            "process_memory",
+            "进程内存",
+            "ok",
+            "这个平台读不到进程内存（只有 Linux 有 /proc/self/status）",
+            details=memory,
+        ))
+    else:
+        used = memory.get("used_percent")
+        if used is None:
+            memory_status = "ok"
+            memory_msg = f"常驻内存 {memory['rss_mb']} MB；没有检测到容器内存上限"
+            memory_action = ""
+        elif used >= 90:
+            memory_status = "error"
+            memory_msg = (
+                f"常驻内存 {memory['rss_mb']} MB / 上限 {memory['limit_mb']} MB"
+                f"（{used}%）——随时可能被 OOM 杀掉"
+            )
+            memory_action = "把这一段贴进 issue；同时考虑调大实例内存"
+        elif used >= 75:
+            memory_status = "warning"
+            memory_msg = (
+                f"常驻内存 {memory['rss_mb']} MB / 上限 {memory['limit_mb']} MB"
+                f"（{used}%）"
+            )
+            memory_action = "留意是否持续上涨；报问题时带上这一段"
+        else:
+            memory_status = "ok"
+            memory_msg = (
+                f"常驻内存 {memory['rss_mb']} MB / 上限 {memory['limit_mb']} MB"
+                f"（{used}%）"
+            )
+            memory_action = ""
+        checks.append(_check(
+            "process_memory",
+            "进程内存",
+            memory_status,
+            memory_msg,
+            details=memory,
+            action=memory_action,
         ))
 
     summary = {"ok": 0, "warning": 0, "error": 0}

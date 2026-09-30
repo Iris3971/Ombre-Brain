@@ -66,6 +66,18 @@ def test_abandoned_excluded():
     assert collect_resurfaced_plans(buckets, {"bkt1"}, NOW_IN) == []
 
 
+def test_dont_surface_excluded():
+    plan = _plan("p1", "bkt1")
+    plan["metadata"]["dont_surface"] = True
+    assert collect_resurfaced_plans([plan], {"bkt1"}, NOW_IN) == []
+
+
+def test_digested_excluded():
+    plan = _plan("p1", "bkt1")
+    plan["metadata"]["digested"] = "true"
+    assert collect_resurfaced_plans([plan], {"bkt1"}, NOW_IN) == []
+
+
 # --- window 过滤（复用 is_window_open）---
 def test_window_not_yet_open_excluded():
     buckets = [_plan("p1", "bkt1")]

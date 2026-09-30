@@ -210,7 +210,45 @@ async def _resolve_supersedes(target_id: str, aspect: str) -> dict:
     return target
 
 
+def _find_same_content(content: str):
+    """09-27：同一个念头不再写第二份。库里已有正文一模一样的候选或 I 条目就返回 (id, meta)。
+    （之前 dream 每次提同一句「我觉得…」都新建一条候选，一句话在库里攒了 5 份，还升了两次 I。）"""
+    import re as _re
+    import frontmatter as _fm
+    from pathlib import Path as _P
+    want = _re.sub(r"\s+", "", content or "")
+    if not want:
+        return None
+    try:
+        for f in _P(rt.bucket_mgr.base_dir).rglob("*.md"):
+            if "archive" in f.parts:
+                continue
+            try:
+                post = _fm.load(str(f))
+            except Exception:
+                continue
+            if _re.sub(r"\s+", "", post.content or "") == want:
+                meta = post.metadata or {}
+                if I_CANDIDATE_TAG in (meta.get("tags") or []) or str(meta.get("type") or "") == "i" or meta.get("i_stage"):
+                    return str(meta.get("id") or ""), meta
+    except Exception:
+        return None
+    return None
+
+
 async def _write_candidate(content: str, aspect: str, supersedes: str = "") -> str:
+    same = _find_same_content(content)
+    if same:
+        same_id, same_meta = same
+        stage = str(same_meta.get("i_stage") or "")
+        if str(same_meta.get("type") or "") == "i":
+            return f"这个念头已经是 I 了（{same_id}），不用再写。"
+        if stage == "promoted":
+            return f"这个念头已经升成 I 了（{same_id} → {same_meta.get('i_promoted_to') or '?'}），不用再写。"
+        added = await record_dream_pass([same_id])
+        dates = dream_dates(same_meta)
+        return (f"这个念头已经在候选里了（{same_id}），这次算又见证一次"
+                f"（{len(dates) + added}/{I_PROMOTE_THRESHOLD}）。够了就用 I(promote=\"{same_id}\")。")
     tags = [I_CANDIDATE_TAG]
     if aspect:
         tags.append(f"aspect:{aspect}")

@@ -337,7 +337,7 @@ feel 桶自身：
 
 `omitted_by_policy` 是被 `dont_surface`/`digested` 挡掉的条数——给它是为了让「过滤有没有真的生效」可观测：静默为 0 和静默漏出来，在调用方眼里长得一样。
 
-> **为什么不用 `structuredContent`**：`-> str` 的工具今天已经有 `structuredContent`，但 FastMCP 把原始类型包成 `{"result": "<同一段渲染文本>"}`，没有信息量。要放进 `bucket_ids` 必须改成返回 `CallToolResult`（`content` 可保持逐字不变），代价是 `outputSchema` 从 `{"result": string}` 变成 `None`。3.6.4 选择不动返回类型，把契约放在文本里的独立块中。
+> **为什么不用 `structuredContent`**：`-> str` 的工具今天已经有 `structuredContent`，但 FastMCP 把原始类型包成 `{"result": "<同一段渲染文本>"}`，没有信息量。要放进 `bucket_ids` 必须改成返回 `CallToolResult`（`content` 可保持逐字不变），代价是 `outputSchema` 从 `{"result": string}` 变成 `None`。3.6.4 选择不动返回类型，把契约放在文本里的独立块中。testing 起可用 `config.mcp.compact_tool_result: true` 去掉这份 `{"result": ...}` 副本（所有工具只回 `content`、不声明 `outputSchema`；默认关，行为不变）。
 
 #### 检索的门：召回与排序目前没有分开（已知设计债）
 
@@ -379,7 +379,7 @@ if text_match or semantic_match: 入选
 
 `FootprintSnapshot` 从兼容路径 `_ledger/events.jsonl` 读取 append-only 事件镜像并压缩展示；Markdown 正文仍是当前运行时的内容真源，Footprint 不复制正文，也不把 Ledger 提升为新的真源。旧存储名 `LedgerMirror` 保留用于兼容，面向模型的产品概念统一称为 Footprint。
 
-恢复是对归档状态的显式逆操作：`trace(bucket_id="...", restore=True)` 必须单独调用。`BucketManager.restore_archived()` 根据创建足迹恢复原 bucket type，清除 tombstone/deleted_at 等归档标记，把 Markdown 移回对应活跃目录，重建正文与 meaning 派生索引，并追加 `TraceRestored`。归档期间会保留历史 pinned 标记，但恢复提交会原子清除它，避免记忆静默重新占用 pinned 配额；importance 本身不设硬配额，恢复后原样保留。历史档案若异常同时带有 protected 与 anchor，普通恢复会拒绝；调用 `trace(bucket_id="...", restore=True, protected=0, importance=1..10)` 可在同一事务中保留 anchor、解除保护并恢复。普通查询、无参 breath 和 Footprint 展示均没有恢复权限。
+恢复是对归档状态的显式逆操作：`trace(bucket_id="...", restore=True)` 必须单独调用。`BucketManager.restore_archived()` 根据创建足迹恢复原 bucket type，清除 tombstone/deleted_at 等归档标记，把 Markdown 移回对应活跃目录，重建正文与 meaning 派生索引，并追加 `TraceRestored`。归档期间会保留历史 pinned 标记，但恢复提交会原子清除它，避免记忆静默重新占用 pinned 配额；importance 本身不设硬配额，恢复后原样保留。恢复还会在同一次原子提交里把 `last_active` 刷新为恢复时刻，避免低分桶在下一轮衰减中立即再次归档；但 `resolved`/`digested` 原样保留（包括衰减在归档 importance≤4 的久未激活桶前同一轮自动写入的 `resolved=True`），因此已结案（或已结案且已消化）、importance 偏低的桶即使刚恢复，分数仍可能低于归档阈值，下一轮衰减仍可能再次归档。历史档案若异常同时带有 protected 与 anchor，普通恢复会拒绝；调用 `trace(bucket_id="...", restore=True, protected=0, importance=1..10)` 可在同一事务中保留 anchor、解除保护并恢复。普通查询、无参 breath 和 Footprint 展示均没有恢复权限。
 
 ### 3.2 `hold` — 存储单条记忆
 
@@ -1429,7 +1429,8 @@ normalized = total / w_sum × 100   # 归一化到 0~100
 | `dehydration.model` | `deepseek-chat` | LLM 模型名 |
 | `dehydration.base_url` | `https://api.deepseek.com/v1` | OpenAI 兼容 endpoint |
 | `dehydration.api_key` | `""` | 推荐用环境变量传入，不要写文件 |
-| `dehydration.max_tokens` | `1024` | 单次生成上限 |
+| `dehydration.max_tokens` | `1024` | 未指定专用预算时的单次生成上限 |
+| `dehydration.import_max_tokens` | `8192` | 批量历史导入提取的独立输出预算；默认 8192，可按模型能力调整。最大值 9007199254740991 仅用于保证 Dashboard/JSON 整数无损往返，不是模型预算的业务上限 |
 | `dehydration.temperature` | `0.1` | 采样温度 |
 | `embedding.enabled` | `true` | 启用向量检索 |
 | `embedding.backend` | `api` | 只支持 `api`（OpenAI 兼容端点）；本地离线向量化不是另一个后端，而是把 `base_url` 指向 OB 托管的 Ollama 边车 |

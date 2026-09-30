@@ -86,6 +86,20 @@ def test_plan_window_dates_expand_to_configured_local_day(monkeypatch):
     ) == "2026-09-02T09:30:00+08:00"
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected_date"),
+    [("20260902", "2026-09-02"), ("2026-W36-3", "2026-09-02")],
+)
+def test_compact_iso_dates_expand_window_end_to_full_day(
+    monkeypatch, raw, expected_date
+):
+    monkeypatch.setattr("tools.plan.core.get_tzinfo", lambda: timezone(timedelta(hours=8)))
+
+    assert normalize_plan_window(raw, boundary="end") == (
+        f"{expected_date}T23:59:59.999999+08:00"
+    )
+
+
 def test_plan_window_preserves_explicit_offset_and_accepts_z():
     assert normalize_plan_window(
         "2026-09-02T09:30:00+09:00", boundary="start"
@@ -126,6 +140,24 @@ async def test_plan_single_ended_past_window_is_persisted(bucket_mgr):
     assert bucket["metadata"]["window_end"] == "2020-01-01T23:59:59.999999+08:00"
     assert "window_start" not in bucket["metadata"]
     assert bucket["metadata"]["change_log"][0]["action"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_plan_preserves_testing_cue_alongside_window(bucket_mgr):
+    _install_runtime(bucket_mgr)
+
+    result = await plan_create(
+        "cue and window",
+        window_start="2026-09-02",
+        cue={"date": "2026-09-03", "after_days": 2},
+    )
+    bucket = await bucket_mgr.get(_created_id(result))
+
+    assert bucket["metadata"]["window_start"] == "2026-09-02T00:00:00+08:00"
+    assert bucket["metadata"]["cue"] == {
+        "date": "2026-09-03",
+        "after_days": 2,
+    }
 
 
 @pytest.mark.asyncio

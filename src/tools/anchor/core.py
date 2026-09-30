@@ -107,7 +107,12 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
             circuit = queue_state.get("circuit") or {}
             status += (
                 f"向量索引队列: 待处理 {queue_state['pending']} 个"
-                f"（重试中 {queue_state['retrying']} 个）"
+                f"（重试中 {queue_state['retrying']} 个"
+                + (
+                    f"，已放弃 {queue_state['abandoned']} 个"
+                    if queue_state.get("abandoned") else ""
+                )
+                + "）"
                 + (
                     f"，供应商熔断中（连续失败 "
                     f"{circuit.get('consecutive_failures', 0)} 次）"

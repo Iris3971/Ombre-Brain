@@ -356,6 +356,69 @@ class MCPJSONAcceptShim:
         await self.app(scope, receive, send)
 
 
+class MCPStatelessGetShim:
+    """无状态模式下对 ``GET /mcp`` 直接回 405，不建独立 SSE 流。
+
+    mcp SDK v1.x 在 ``stateless_http=True`` 时仍会把带
+    ``Accept: text/event-stream`` 的 GET 接成一条 200 的 SSE 流（上游
+    python-sdk #3492）。无状态下服务端不可能往这条流推任何消息，它只会
+    零字节一直挂到客户端断开；同 host 并发受限的客户端（如 OkHttp 默认
+    每 host 5 条）攒满几条这样的流后，后续 initialize / tools 调用都会在
+    客户端排队卡住。按 Streamable HTTP 规范，不提供 GET 流的服务端应回
+    405，客户端据此停止尝试。只拦 MCP 端点的 GET，其它方法和路径原样透传；
+    注册在鉴权内层，未授权请求仍先拿到 401。
+    """
+
+    _BODY = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": "server-error",
+            "error": {
+                "code": -32600,
+                "message": (
+                    "Method Not Allowed: stateless server does not offer "
+                    "a GET SSE stream"
+                ),
+            },
+        }
+    ).encode("utf-8")
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
+    ) -> None:
+        self.app = app
+        self.path_matcher = path_matcher
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") == "http"
+            and str(scope.get("method", "")).upper() == "GET"
+            and self.path_matcher(scope.get("path"))
+        ):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 405,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"allow", b"POST"),
+                        (b"content-length", str(len(self._BODY)).encode()),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": self._BODY,
+                    "more_body": False,
+                }
+            )
+            return
+        await self.app(scope, receive, send)
+
 class OriginCSRFGuardMiddleware:
     """Reject cross-origin state-changing requests to the cookie-session surface.
 
@@ -723,6 +786,13 @@ def build_http_app(
             MCPJSONAcceptShim,
             path_matcher=mcp_path_matcher,
         )
+        # 无状态模式下 GET 流不可能收到服务端消息，直接 405（见 MCPStatelessGetShim）。
+        # 注册在 MCPAuthMiddleware 之前，即包在鉴权内层：未授权 GET 仍先回 401。
+        if bool(getattr(getattr(mcp, "settings", None), "stateless_http", False)):
+            app.add_middleware(
+                MCPStatelessGetShim,
+                path_matcher=mcp_path_matcher,
+            )
     app.add_middleware(
         MCPAuthMiddleware,
         auth_required=settings.auth_required,

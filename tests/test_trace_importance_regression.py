@@ -234,3 +234,116 @@ async def test_trace_atomically_switches_pinned_to_protected(bucket_mgr):
     assert switched["metadata"]["protected"] is True
     assert switched["metadata"]["importance"] == 10
     assert switched["metadata"]["type"] == "dynamic"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, -3, 11])
+async def test_trace_rejects_out_of_range_importance_without_writing(bucket_mgr, bad):
+    bucket_id = await bucket_mgr.create(
+        content="Out-of-range importance must not be dropped silently.",
+        importance=6,
+        domain=["rules"],
+    )
+    install_runtime(bucket_mgr)
+
+    with pytest.raises(ToolInputError, match="importance"):
+        await trace_core(bucket_id, importance=bad)
+    with pytest.raises(ToolInputError, match="importance"):
+        await trace_core(bucket_id, importance=bad, tags="changed")
+    unchanged = await bucket_mgr.get(bucket_id)
+
+    assert unchanged["metadata"]["importance"] == 6
+    assert "changed" not in (unchanged["metadata"].get("tags") or [])
+
+
+class _NoopDecay:
+    is_running = True
+
+    async def ensure_started(self):
+        return None
+
+    def calculate_score(self, meta):
+        return float(meta.get("importance") or 5)
+
+
+class _NeutralDehydrator:
+    api_available = True
+
+    async def analyze(self, content):
+        return {"domain": ["general"], "valence": 0.5, "arousal": 0.3,
+                "tags": [], "suggested_name": ""}
+
+    async def dehydrate(self, content, meta=None):
+        return content
+
+
+class _DisabledEmbedding:
+    enabled = False
+
+
+def _install_hold_runtime(bucket_mgr):
+    install_runtime(bucket_mgr)
+    rt.config = {"surfacing": {}, "limits": {}}
+    rt.decay_engine = _NoopDecay()
+    rt.dehydrator = _NeutralDehydrator()
+    rt.embedding_engine = _DisabledEmbedding()
+    rt.record_v3_tool_event = lambda *_a, **_k: None
+
+
+async def _hold_and_collect(monkeypatch, bucket_mgr, content, **kwargs):
+    import errors
+    from tools.hold import dispatch as hold_dispatch
+
+    monkeypatch.setattr(errors, "_errors_path", None)
+    _install_hold_runtime(bucket_mgr)
+    errors.begin_warnings()
+    try:
+        await hold_dispatch(content=content, **kwargs)
+    finally:
+        warnings = errors.pop_warnings()
+    stored = [b for b in await bucket_mgr.list_all() if content in b.get("content", "")]
+    return warnings, stored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad,expected", [(0, 1), (-3, 1), (11, 10), ("abc", 5)])
+async def test_hold_out_of_range_importance_is_clamped_with_w001(
+    monkeypatch, bucket_mgr, bad, expected
+):
+    content = f"hold importance feedback case {bad}"
+    warnings, stored = await _hold_and_collect(
+        monkeypatch, bucket_mgr, content, importance=bad
+    )
+
+    assert len(stored) == 1
+    assert stored[0]["metadata"]["importance"] == expected
+    assert sum("OB-W001" in w for w in warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_hold_in_range_importance_has_no_w001(monkeypatch, bucket_mgr):
+    warnings, stored = await _hold_and_collect(
+        monkeypatch, bucket_mgr, "hold importance in range", importance=7
+    )
+
+    assert stored[0]["metadata"]["importance"] == 7
+    assert not any("OB-W001" in w for w in warnings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["feel", "pinned"])
+async def test_hold_feel_or_pinned_ignores_importance_without_w001(
+    monkeypatch, bucket_mgr, flag
+):
+    extra = {flag: True}
+    if flag == "feel":
+        extra["source_bucket"] = await bucket_mgr.create(
+            content="source memory for feel", importance=5, domain=["general"]
+        )
+    warnings, stored = await _hold_and_collect(
+        monkeypatch, bucket_mgr, f"hold {flag} ignores importance", importance=0,
+        **extra,
+    )
+
+    assert len(stored) == 1
+    assert not any("OB-W001" in w for w in warnings)

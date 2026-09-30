@@ -703,13 +703,15 @@ docker compose -f deploy/docker-compose.yml up -d
 | `transport` | `stdio`（本地）/ `streamable-http`（远程） | Docker 部署用 `streamable-http` |
 | `dehydration.model` | 脱水/打标 LLM 模型 | `gemini-2.0-flash` |
 | `dehydration.base_url` | LLM API 地址 | `https://generativelanguage.googleapis.com/v1beta/openai/` |
-| `dehydration.max_tokens` | 模型最大输出 token | `4096`（必须足够大，否则 JSON 截断导致域分类失败） |
+| `dehydration.max_tokens` | 未指定专用预算时的默认输出 token | `4096`（必须足够大，否则 JSON 截断导致域分类失败） |
+| `dehydration.import_max_tokens` | 批量历史导入提取的独立输出预算；默认 8192，可按模型能力调整（最大值仅为 Dashboard/JSON 无损整数边界） | `8192` |
 | `dehydration.timeout_seconds` | LLM 请求超时秒数 | 国内服务器连云端 API 可设 `120` 或更高 |
 | `embedding.api_format` | `gemini`（云端）/ `ollama`（本地 bge-m3）/ `openai_compat` | `gemini` |
 | `embedding.model` | embedding 模型 | 云端 `gemini-embedding-001` / 本地 `bge-m3` |
 | `embedding.timeout_seconds` | 向量化请求超时秒数 | 国内服务器连云端 API 可设 `120` 或更高 |
 | `embedding.background_indexing` | 原文落盘后由耐久后台队列生成向量 | `true` |
 | `embedding.retry_base_seconds` / `retry_max_seconds` | 向量失败后的指数退避起点 / 上限 | `5` / `300` |
+| `embedding.abandon_after_failures` | 供应商正常时同一条向量仍失败几次后放弃重试（原文不受影响）；`0` 为永不放弃 | `0` |
 | `decay.lambda` | 衰减速率，越大越快忘 | `0.05` |
 | `merge_threshold` | 合并相似度阈值 (0-100) | `75` |
 | `hooks.token` | `/breath-hook` 的 HTTP token | 自托管公网建议设置 |

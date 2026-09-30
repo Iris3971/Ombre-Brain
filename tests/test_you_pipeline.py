@@ -7,7 +7,12 @@
 import pytest
 
 from ombrebrain.you import YouService, YouStore, YouStoreError
-from ombrebrain.you.service import MIN_SUPPORTING_BUCKETS, REQUIRED_CONFIRMATIONS
+from ombrebrain.you.service import (
+    _MAX_HINT_TOKENS,
+    MIN_SUPPORTING_BUCKETS,
+    REQUIRED_CONFIRMATIONS,
+)
+from utils import count_tokens_approx
 
 
 class FakeBucketManager:
@@ -319,3 +324,51 @@ async def test_归档的依据仍然撑得住(tmp_path, monkeypatch):
     manager.buckets["memory-1"] = 归档了
 
     assert "Lin" in await service.recall(query="称呼")
+
+
+_长认识 = ("她聊到说话方式时反复表示希望先听结论再听原因，" * 6)[:128]
+
+
+async def _formalized_long(service, manager, monkeypatch):
+    for bucket_id in ("memory-3", "memory-4"):
+        manager.buckets[bucket_id] = _bucket(bucket_id, f"{bucket_id} 里的另一段对话。")
+    for day in (19, 20, 21):
+        _stamp(monkeypatch, day)
+        claim, _ = await service.write(
+            content=_长认识,
+            bucket_ids=["memory-3", "memory-4"],
+            aspect="communication_preference",
+            concept_key="reply_style",
+            concept_value="conclusion_first",
+            basis="explicit_statement",
+            explicit=True,
+            long_term=True,
+        )
+    return claim
+
+
+@pytest.mark.asyncio
+async def test_一条放不下不连累后面放得下的(tmp_path, monkeypatch):
+    service, manager = _enabled(tmp_path)
+    短 = await _formalized(service, monkeypatch)
+    长 = await _formalized_long(service, manager, monkeypatch)
+    assert service._query_score(长, "希望先听结论") > service._query_score(短, "希望先听结论")
+
+    读回 = await service.recall(query="希望先听结论")
+    assert "Lin" in 读回
+    assert _长认识 not in 读回
+    assert count_tokens_approx(读回) <= _MAX_HINT_TOKENS
+
+    带id = await service.recall(query="希望先听结论", with_ids=True)
+    assert "Lin" in 带id and f"id={短.id}" in 带id
+    assert f"id={长.id}" not in 带id
+    assert count_tokens_approx(带id) <= _MAX_HINT_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_没有正文就不返回空头部(tmp_path, monkeypatch):
+    service, manager = _enabled(tmp_path)
+    await _formalized_long(service, manager, monkeypatch)
+
+    assert await service.recall(query="希望先听结论") == ""
+    assert await service.recall(query="希望先听结论", with_ids=True) == ""

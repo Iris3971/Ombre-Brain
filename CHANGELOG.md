@@ -2,6 +2,143 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 3.8.0
+
+> testing 分支，待主负责人审核后合入 main。处理上游 open issue 的一批修复，另移植 PR #130（作者 Iris3971）和 PR #125 里的两处加固（作者陈阳）。新增的配置项都默认关或保持原值，旧配置不用改。
+
+### 修复 / Fixed
+
+- **批量 Markdown 导入提取的输出预算写死 2048**（#127，移植自 PR #130，作者 Iris3971）：合法 JSON 一超过 2048 token 就被
+  截断、解析失败、整块导入失败。新增 `dehydration.import_max_tokens`（默认 8192），Dashboard 和配置接口可读写、热更新、
+  保存失败回滚；旧客户端不带这个字段时不覆盖。
+- **全数字的桶 id 被拒收**（#128 #129）：12 位 hex id 约 0.36% 全是数字，客户端写成 JSON 数字时参数校验报错。I / trace /
+  anchor / release / hold / plan / letter_lock_update 的 11 个 id 参数现在把整数收成字符串，对外 schema 仍是 string。
+- **越界 importance 被静默处理**（#128 #129）：hold 照旧修正到 1～10，但补发 OB-W001；trace 收到越界值改为报错，不再静默丢弃。
+- **You 读回整段为空**（#124）：排在前面的一条认识超出预算时只跳过它，不再连带丢掉后面放得下的；没有正文时不再返回两行
+  空头部。160 token 上限不变。
+- **保存被启动环境变量接管的配置时显示干净的成功**（#122）：保存压缩 / 向量化配置时，如果字段（含旧名 `OMBRE_API_KEY`、
+  `OMBRE_BASE_URL`、`OMBRE_COMPRESS_API_FORMAT`）来自启动环境变量，返回里加一条警告：重启或重建容器后会被覆盖。只列变量名，
+  不改保存结果和状态码。
+- **归档文件名双拼 id、撞名后每轮归档失败**（#118）：撞名时先剥掉结尾重复的 `_id`，再依次试 `名字_id`、`名字_2_id`……找空位；
+  永不覆盖、永不删除已有归档。软删除同样处理。
+- **type 被改写的旧信仍会被衰减归档**（#84）：衰减循环改为按逻辑身份识别信件（source_tool=letter / `__letter__` / 锁信），
+  不再只看 type。
+- **无状态模式下 GET /mcp 挂着一条永远空着的 SSE 流**（#106）：现在一律回 405（Allow: POST），原来 Accept 不含 event-stream
+  时的 406 也改成 405。空流会占住客户端连接，同一 host 并发受限的客户端攒满几条后会卡在 CONNECTING（是否就是 #106
+  报告者的原因还没确认）。鉴权仍在前面，未授权照旧 401。
+
+### 加固 / Hardening
+
+- **热更新清单缺 sha256 / size 时照样当作已校验**（移植自 PR #125，作者陈阳）：清单项的 path、size、sha256 现在必须
+  齐全且格式正确，缺一项整次更新中止；清单内和压缩包内只差大小写的重复路径也中止。只防生成器出错或包损坏，防不了
+  篡改（清单和代码在同一个包里）。
+- **GitHub 导入失败回滚会部分落盘、不是原子写**（移植自 PR #125，作者陈阳）：先整包预检，越界、链接类成员、加密成员、
+  文件与目录前缀冲突在所有平台拒绝，设备名、冒号、结尾空格或点、大小写重复只在 Windows 上查；有坏成员一个都不还原。
+  再逐个写同目录临时文件、fsync 后原子替换，不跟随库内链接；库目录本身是链接时照常还原。
+
+### 新增 / Added
+
+- `mcp.compact_tool_result`（默认关，#126）：打开后所有工具（含 You / Them）只回 content 文本，不再附同一段文字的
+  structuredContent 副本，也不声明 outputSchema；把整个响应存进对话历史的客户端能少一半体量。改完要重启服务、客户端重连。
+- `embedding.abandon_after_failures`（默认 0 = 永不放弃，#117）：一条向量在别的向量都能成功、只有它反复失败够 N 次时停止
+  重试；原文和队列条目都保留，错误面板 / pulse / Dashboard 显示已放弃数；改内容、补齐缺失向量或换引擎后重新尝试。
+
+### 测试 / Tests
+
+- 补「归档 → trace(restore=True) → 下一轮衰减」端到端回归测试（#82 的问题 2 早已修复，这里锁住）；INTERNALS 写明恢复保留
+  resolved / digested。
+
+## 3.7.0
+
+> testing 分支，待主负责人审核后合入 main。从一个长期运行的实例里提出来的通用改动。全部默认关或行为不变，开关都在 config.example.yaml 里有注释。
+> 下面的读数来自该实例的 LoCoMo / LongMemEval 跑分（同一读者、同一判卷），只供方向参考，不是可比的榜。
+
+### 检索 / Retrieval
+
+- **多通道融合可选 RRF**（`matching.fusion: rrf`，默认 `weighted` 不变）：BM25 / 向量 / 字面 / 主题各取 top-K 并集再
+  Reciprocal Rank Fusion。实例上 LongMemEval hit@5 0.76→0.90，LoCoMo 0.55→0.77。
+- **交叉重排**（`retrieval.rerank`，默认关）：命中再过一遍 reranker（OpenAI 兼容 rerank 端点，复用 embedding 的
+  base_url/key），只改顺序，失败原序返回。
+- **一跳扩展**（`retrieval.hop`，默认关）：命中旁边的（前后 / 同实体 / 已有链接）也进池子再排。
+- **同款折叠**（`retrieval.collapse_covered`，默认关）：被同一条要义盖住的命中只留 keep 条，要义顶前面。
+- **命中带日期**（`retrieval.surface_created`，默认关）：命中头部加 `[YYYY-MM-DD 周x]`。弱读者上 LongMemEval 0.64→0.80。
+- `surfacing.search_max_results`：带 query 的检索单独一个默认条数（0 = 同 breath_max_results）。
+- `matching.automatic_hides_core`（默认关）：mode=automatic 的召回不返回 pinned/permanent（它们每轮已在场）。
+- breath_search 认桶的 `no_drift` 标记：技术备忘不参与随机浮现。
+
+### 浮现 / Surfacing
+
+- **那天的今天**（`surfacing.anniversary_slots`，默认 0）：无 query 浮现末尾单独一段，放创建日与今天同日（≥25 天前）的桶。
+- **心情一致**（`surfacing.mood_weight`，默认 0）：breath_advanced 不带 query 时 valence/arousal 当此刻心情，只给排序乘一个靠近度系数。
+
+### 写入 / Write side
+
+- `update()` 现在真的落 `situation` / `links` / `cue` 三个字段（此前被静默丢掉），并透传 `created` / `last_active` /
+  `i_superseded_by` / `i_disputed_by` / `anchor`；`create()` 接受 `created`。
+- 桶类型多了 `gist` / `recollection`（要义 / 回忆版本）。
+- **情境指纹**（`situation`，默认关）：hold/plan 没显式给 context 时从配置的文件读「此刻」写进桶。
+
+### 衰减与做梦 / Decay & Dream
+
+- `decay.model: actr`（默认 `ebbinghaus` 不变）：ACT-R 基础激活（想起史 × 独特性），`actr_d` / `recall_log` / `gist_ledger` 可配。
+- `dream.replay_slots`（默认 0）：给最近的事配更早的旧事摆在一起；`dream.feel_prompt`（默认关）：对动静大的事只摆一个问题。
+- I 候选：正文一样的念头不再写第二份。
+
+### 服务 / Server
+
+- `mcp.instructions`：握手时交给客户端的说明（MCP instructions 字段），设了才带。
+
+### 依赖 / Dependencies
+
+- **pyjwt 2.13.0 → 2.14.0**：pip-audit 报十个 CVE（CVE-2026-102265 等），2.13.0 无修复版本。2.14.0 发布于
+  2026-09-11，晚于 CI 锁校验的包索引快照（2026-08-01），所以把 `UV_EXCLUDE_NEWER` 推进到 2026-09-12 并
+  重新生成两份锁。这是一次和 2026-08-09 同类的明确接受的破坏性变更：发布锁动了 31 个包，含
+  **openai 2.52.0 → 3.13.0（大版本）**、mcp 1.29.0 → 1.30.0、starlette 1.3.1 → 1.6.0、sse-starlette、
+  pydantic-settings 等；tqdm / distro / colorama 退出，httpx2 系列进来。旧更新器会判「依赖变了」并触发
+  一次依赖安装；v2.8.4 之前的实例可能需要手动升级一次。基线哈希已推进（tests/test_update_source_gate.py）。
+
+## 3.6.14
+
+> 三条上游反馈。没有新功能——内存那条加的是读数，不是能力。
+
+### 修复 / Fixed
+
+- **写入被拒时不说是哪个字段，模型只好反复重写正文。** 写入一次查
+  content / concept_key / concept_value 三个字段，报错却只说「这条写不进去」。
+  - 真机上正文**完全合规**（「他做事犹豫，体制内工作」查下来是 False），
+    踩线的是 `concept_key="personality"`——那张禁止表里有 `personality` /
+    `性格` / `人格` / `mbti` / `identity`。模型看着那句指向正文的报错，
+    **连续五次重写正文**，那个键一次都没动。
+  - 现在逐字段查，报错点名：「踩线的是 **concept_key**（不是整条都不行）」，
+    并明说「正文没被点名就说明正文本身没问题，重写它没有用」。you / them 同改。
+  - **过滤规则本身没有放松**：rule.md 13.2 的禁止清单里明写了「性格」，
+    13.3 说 them 用同一张表。拦是对的，只是没说清拦在哪。
+- **You 读回看不见自己在攒什么，三日门槛因此走不完。** 候选不进召回是对的，
+  但这也意味着写完就失联：重申要求「同一个 concept_key + concept_value 再写
+  一次」，而那两个字符串只存在于写它的那次对话里，换窗之后无从得知。
+  - them 早就有这段欠账清单（`them/service.py::_pending_digest`），You 一直
+    没有——上游反馈里 You 的抱怨比 them 尖锐，原因就在这。
+  - 现在裸读 `You()` 会列出还在攒的候选，带齐重申需要的全部东西：
+    `concept_key=concept_value`、aspect、正文、**bucket_ids**、`id`、
+    还差几个不同的日子。任何一个窗口拿到就能接力。
+  - **带 query 的读回不附欠账**：`recall(query="Lin")` 问的是「我对 Lin 了解
+    什么」，拿还没算数的候选去回答是答非所问。被动浮现同样拿不到——欠账是
+    待办，浮现是「想起了什么」。
+  - them 的清单一并补上了 `bucket_ids`。
+
+### 新增 / Added
+
+- **诊断页多一段进程内存读数**（`/api/system/diagnostics` 的 `process_memory`）。
+  上游报了 Render 512MB 上 OOM，但报告里只有「内存持续增长」——没有 RSS、
+  没有上限确认、没有哪一类对象在涨。仓库里几个最可疑的地方查下来都是有界的
+  （语义检索走 `fetchmany(32)` + O(top_k) 堆、无模块级常驻缓存、metrics 无状态），
+  再往下就是猜。
+  - RSS 取自 `/proc/self/status`；**容器上限走 cgroup 而不是 `/proc/meminfo`**——
+    容器里后者报的是宿主机内存，照它算会得出「用了 2%」而进程正在被 OOM
+    killer 杀掉。v2 的 `"max"` 与 v1 那个接近 2^63 的哨兵值都当作「没有上限」。
+  - 超过 75% 报 warning、90% 报 error，并提示把这一段贴进 issue。
+  - Linux 以外安静降级（`available: false`），不让诊断页整页失败。
+
 ## 3.6.13
 
 > 一个参数没开出来的 bug。没有新功能。

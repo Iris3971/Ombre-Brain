@@ -355,6 +355,144 @@ async def test_kelivo_compatible_stateless_json_handshake_lists_all_tools():
                 assert all(isinstance(tool.get("inputSchema"), dict) for tool in tools)
 
 
+
+@pytest.mark.asyncio
+async def test_stateless_get_mcp_returns_405_instead_of_idle_sse_stream(
+    monkeypatch,
+):
+    import server
+
+    assert server.mcp.settings.stateless_http is True
+    # StreamableHTTPSessionManager.run() 每个实例只能跑一次，本测试用新的。
+    monkeypatch.setattr(server.mcp, "_session_manager", None)
+    app = build_http_app(
+        server.mcp,
+        "streamable-http",
+        settings=HTTPRuntimeSettings(
+            auth_required=False,
+            max_request_bytes=DEFAULT_MAX_MCP_REQUEST_BYTES,
+        ),
+        token_validator=lambda *_args, **_kwargs: False,
+        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
+    )
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://localhost",
+        ) as client:
+            response = await asyncio.wait_for(
+                client.get(
+                    "/mcp",
+                    headers={
+                        "accept": "application/json,text/event-stream",
+                        "mcp-protocol-version": "2025-11-25",
+                    },
+                ),
+                5,
+            )
+            assert response.status_code == 405
+            assert "POST" in response.headers["allow"]
+            assert response.headers["content-type"].startswith(
+                "application/json"
+            )
+            payload = response.json()
+            assert payload["jsonrpc"] == "2.0"
+            assert payload["error"]["code"] == -32600
+
+            for accept in (None, "*/*", "application/json"):
+                headers = {} if accept is None else {"accept": accept}
+                plain = await asyncio.wait_for(
+                    client.get("/mcp", headers=headers), 5
+                )
+                assert plain.status_code == 405, accept
+                assert "POST" in plain.headers["allow"]
+
+            initialize = await client.post(
+                "/mcp",
+                headers={
+                    "accept": "application/json,text/event-stream",
+                    "content-type": "application/json",
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "probe", "version": "0"},
+                    },
+                },
+            )
+            assert initialize.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_stateless_get_mcp_still_requires_auth_before_405():
+    class FakeMCP:
+        settings = SimpleNamespace(stateless_http=True)
+
+        def streamable_http_app(self):
+            return Starlette()
+
+    app = build_http_app(
+        FakeMCP(),
+        "streamable-http",
+        settings=HTTPRuntimeSettings(
+            auth_required=True,
+            max_request_bytes=2048,
+            auth_mode="token",
+        ),
+        token_validator=lambda token, **_kwargs: token == "good",
+        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://localhost",
+    ) as client:
+        anonymous = await client.get(
+            "/mcp", headers={"accept": "text/event-stream"}
+        )
+        assert anonymous.status_code == 401
+        assert "www-authenticate" in anonymous.headers
+
+        authorized = await client.get(
+            "/mcp",
+            headers={
+                "accept": "text/event-stream",
+                "authorization": "Bearer good",
+            },
+        )
+        assert authorized.status_code == 405
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+def test_stateless_get_shim_only_registered_inside_auth_when_stateless(stateless):
+    class FakeMCP:
+        settings = SimpleNamespace(stateless_http=stateless)
+
+        def streamable_http_app(self):
+            return Starlette()
+
+    app = build_http_app(
+        FakeMCP(),
+        "streamable-http",
+        settings=HTTPRuntimeSettings(auth_required=False, max_request_bytes=2048),
+        token_validator=lambda *_args, **_kwargs: False,
+        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
+    )
+
+    order = [item.cls.__name__ for item in app.user_middleware]
+    if not stateless:
+        assert "MCPStatelessGetShim" not in order
+    else:
+        assert order.index("MCPStatelessGetShim") > order.index(
+            "MCPAuthMiddleware"
+        )
+
 def test_legacy_sse_transport_is_rejected():
     """2026-08-09 起 legacy SSE 传输下线：build_http_app 必须明确拒绝，不能悄悄放行。"""
 

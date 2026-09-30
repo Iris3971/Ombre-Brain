@@ -125,6 +125,7 @@ dehydration:
   #   Gemini:      https://generativelanguage.googleapis.com/v1beta/openai
   # api_key: ""    # ⚠️ Use env var OMBRE_COMPRESS_API_KEY instead / 请使用环境变量 OMBRE_COMPRESS_API_KEY
   max_tokens: 1024
+  import_max_tokens: 8192          # 默认 8192，可按模型能力调整；最大值仅为 Dashboard/JSON 无损整数边界
   temperature: 0.1
   timeout_seconds: 120             # LLM request timeout seconds / LLM 请求超时秒数
   # OpenAI-compatible provider extensions / OpenAI 兼容服务商扩展参数
@@ -140,6 +141,11 @@ decay:
   lambda: 0.05                    # Decay rate / 衰减速率（越大遗忘越快）
   threshold: 0.3                  # Archive threshold / 归档阈值
   check_interval_hours: 24        # Check interval (hours) / 衰减检查间隔（小时）
+  # testing：model = ebbinghaus（默认，上游公式）| actr（ACT-R 基础激活：想起史 × 独特性）。
+  model: ebbinghaus
+  actr_d: 0.5                     # ACT-R 的 d（model=actr 时用）
+  recall_log: ""                  # 想起史账本（jsonl），model=actr 时用；空 = 只按 last_active
+  gist_ledger: ""                 # 要义账本（json），model=actr 时用；空 = 不算被盖住
   emotion_weights:
     base: 1.0                     # Base weight / 基础权重
     arousal_boost: 0.8            # Arousal boost coefficient / 唤醒度加成系数
@@ -155,6 +161,7 @@ embedding:
   circuit_failure_threshold: 3    # Consecutive failures before global pause / 连续失败几次后熔断
   circuit_base_seconds: 30        # First global cooldown / 首次熔断冷却
   circuit_max_seconds: 600        # Maximum global cooldown / 最长熔断冷却
+  abandon_after_failures: 0       # 0 = never; count only failures while other vectors succeed / 0 为永不放弃；只计供应商正常时这一条仍失败的次数
   backend: "api"                  # 只支持 api（OpenAI 兼容端点）
   model: "gemini-embedding-001"   # 云端模型名（如 gemini-embedding-001）
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -179,6 +186,10 @@ matching:
   # 3.2.0 从 0.65 下调到 0.55，依据见 src/bucket_manager.py 的扫描记录。
   vector_recall_threshold: 0.55
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
+  # testing：多通道融合。weighted = 七维加权和（默认，行为不变）；rrf = BM25 / 向量 / 字面 / 主题各取 top-K 并集再 Reciprocal Rank Fusion。
+  fusion: weighted
+  rrf_channel_k: 30               # 每通道取前几条进并集（fusion=rrf 时用）
+  automatic_hides_core: false     # true：mode=automatic 的召回不返回 pinned/permanent（它们每轮已在场）
 
 # --- Surfacing defaults / 浮现默认参数 ---
 # Defaults applied when the AI calls breath() without explicit caps.
@@ -195,6 +206,12 @@ surfacing:
   # 按缺口补（权重自己送进来几条就少补几条），且不超过 max_results 的一半。
   # 设 0 关闭，回到 3.5.0 的纯权重排序。
   recent_slots: 3
+  # testing：带 query 的检索单独一个默认条数；0 或没配 = 同 breath_max_results。
+  search_max_results: 0
+  # testing：无 query 浮现末尾「那天的今天」一段——创建日与今天同日（≥25 天前）的桶放几条；0 关。
+  anniversary_slots: 0
+  # testing：breath_advanced 不带 query 时把 valence/arousal 当此刻心情，排序乘 1+w·(1-距离)，只改顺序；0 关。
+  mood_weight: 0
   # iter 1.8: weighted sampling for breath surfacing mode（无参数浮现）
   # 加权采样：从 top_k 候选里按 score**(1/temperature) 抽 sample_k 个，让"想起"带轻微随机性。
   # 测试 fixture 里默认关 (enabled=false)，保证排序确定。生产可以开。
@@ -254,3 +271,40 @@ bucket_type_defaults:
 # --- Deprecated: Obsidian wikilinks auto injection / 已废弃 ---
 # wikilink 自动注入已禁用；OB 只读取正文里的 [[wikilink]] 做网络图。
 # 旧版 config.yaml 中残留的 wikilink.* 配置会被忽略。
+
+# --- testing：检索侧可选项（全部默认关）---
+retrieval:
+  surface_created: false          # 命中头部带 [YYYY-MM-DD 周x]（弱读者上时间题明显受益）
+  collapse_covered:               # 同款折叠：被同一条要义（gist）盖住的命中只留 keep 条，要义顶前面
+    enabled: false
+    keep: 2
+    min_group: 3
+  rerank:                         # 交叉重排：命中再过一遍 reranker，只改顺序，失败原序返回；用 embedding 的 base_url/key
+    enabled: false
+    pool: 30                      # 送去重排的候选池大小（大于 max_results）
+    model: BAAI/bge-reranker-v2-m3
+  hop:                            # 一跳扩展：命中旁边的（前后 / 同实体 / 已有链接）也进池子再排
+    enabled: false
+    per_hit: 2
+    max_extra: 20
+    seed: 15
+
+# --- testing：情境指纹（默认关）---
+# hold/plan 没显式给 context 时，从这几个文件读「此刻」（地点 / 天气 / 在场的人 / 钟点）写进桶的 situation 字段。
+situation:
+  auto: false
+  world_state: ""                 # e.g. /path/to/world/state.json
+  weather_cache: ""
+  affect: ""
+  chat_history: ""
+  owner_name: ""
+
+# --- testing：做梦的两段可选材料（默认关）---
+dream:
+  replay_slots: 0                 # 给几条最近的事各配一件更早的旧事摆在一起；0 关
+  feel_prompt: false              # 对动静大、还没写过感受的近期事件只摆一个问题
+
+# --- testing：MCP 握手说明（默认不带）---
+mcp:
+  instructions: ""                # 设了就在 MCP 握手的 instructions 字段里交给客户端（claude.ai / Hermes 会转给模型）
+  compact_tool_result: false      # true = 工具只回 content，不再附同文的 structuredContent 副本、也不声明 outputSchema；把整个响应存进历史的客户端能省一半；改完重启，客户端重新连接

@@ -408,3 +408,138 @@ def test_config_edit_invalidates_cache(monkeypatch, tmp_path):
     _os.utime(cfg, (stat.st_atime + 5, stat.st_mtime + 5))
 
     assert get_ai_name() == "新名字"
+
+
+# ============================================================
+# #122：启动环境变量接管的字段，保存成功也要给出「重启会被覆盖」的警告
+# ============================================================
+
+def _setup_embed_save(monkeypatch, tmp_path):
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(
+        config_api.sh, "_project_env_path", lambda: str(tmp_path / ".env")
+    )
+    monkeypatch.setattr(
+        config_api.sh, "config", {"embedding": {"api_key": "old-key"}}
+    )
+    monkeypatch.setattr(
+        config_api.sh, "embedding_engine", SimpleNamespace(enabled=True)
+    )
+    monkeypatch.setattr(
+        config_api, "_rebuild_embedding_runtime", lambda: SimpleNamespace(enabled=True)
+    )
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", lambda mutate: mutate({}))
+    monkeypatch.setenv("OMBRE_EMBED_API_KEY", "old-key")
+
+
+def _setup_compress_save(monkeypatch, tmp_path, client_factory):
+    import openai
+
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda request: None)
+    monkeypatch.setattr(
+        config_api.sh, "_project_env_path", lambda: str(tmp_path / ".env")
+    )
+    monkeypatch.setattr(
+        config_api.sh,
+        "config",
+        {"dehydration": {"api_key": "old-key", "api_format": "openai_compat"}},
+    )
+    monkeypatch.setattr(
+        config_api.sh,
+        "dehydrator",
+        SimpleNamespace(
+            api_key="old-key",
+            base_url="https://old.example/v1",
+            model="old-model",
+            timeout_seconds=60.0,
+            api_format="openai_compat",
+            api_available=True,
+            client=object(),
+        ),
+    )
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", lambda mutate: mutate({}))
+    monkeypatch.setattr(openai, "AsyncOpenAI", client_factory)
+    monkeypatch.setenv("OMBRE_COMPRESS_API_KEY", "old-key")
+
+
+async def _post_env_config(updates):
+    mcp = FakeMCP()
+    config_api.register(mcp)
+    response = await mcp.routes[("POST", "/api/env-config")](
+        JsonRequest({"updates": updates})
+    )
+    return response.status_code, json.loads(response.body)
+
+
+@pytest.mark.asyncio
+async def test_boot_env_shadowed_field_warns_without_leaking_value(
+    monkeypatch, tmp_path
+):
+    import utils
+
+    _setup_embed_save(monkeypatch, tmp_path)
+    monkeypatch.setattr(utils, "BOOT_ENV_CONFIG", frozenset({"OMBRE_EMBED_API_KEY"}))
+
+    status, payload = await _post_env_config({"OMBRE_EMBED_API_KEY": "sk-new-secret-9876"})
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["partial"] is False
+    assert "OMBRE_EMBED_API_KEY" in payload["updated"]
+    assert "OMBRE_EMBED_API_KEY" in payload["persisted"]
+    shadow = [w for w in payload.get("warnings", []) if "启动" in w]
+    assert len(shadow) == 1
+    assert "OMBRE_EMBED_API_KEY" in shadow[0]
+    assert all("sk-new-secret-9876" not in w for w in payload["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_no_boot_env_keeps_clean_success(monkeypatch, tmp_path):
+    import utils
+
+    _setup_embed_save(monkeypatch, tmp_path)
+    monkeypatch.setattr(utils, "BOOT_ENV_CONFIG", frozenset())
+
+    status, payload = await _post_env_config({"OMBRE_EMBED_API_KEY": "sk-new-secret-9876"})
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["partial"] is False
+    assert "warnings" not in payload
+
+
+@pytest.mark.asyncio
+async def test_legacy_boot_env_name_is_reported_as_shadow(monkeypatch, tmp_path):
+    import utils
+
+    _setup_compress_save(monkeypatch, tmp_path, lambda **kwargs: object())
+    monkeypatch.setattr(utils, "BOOT_ENV_CONFIG", frozenset({"OMBRE_API_KEY"}))
+
+    _status, payload = await _post_env_config({"OMBRE_COMPRESS_API_KEY": "new-key"})
+
+    assert payload["ok"] is True
+    assert payload["partial"] is False
+    assert any(
+        "OMBRE_COMPRESS_API_KEY" in w and "OMBRE_API_KEY" in w
+        for w in payload.get("warnings", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_compress_rebuild_has_no_shadow_warning(monkeypatch, tmp_path):
+    import utils
+
+    def fail_client_rebuild(**kwargs):
+        raise ValueError("invalid base URL")
+
+    _setup_compress_save(monkeypatch, tmp_path, fail_client_rebuild)
+    monkeypatch.setattr(
+        utils, "BOOT_ENV_CONFIG", frozenset({"OMBRE_COMPRESS_API_KEY"})
+    )
+
+    _status, payload = await _post_env_config({"OMBRE_COMPRESS_API_KEY": "new-key"})
+
+    assert payload["ok"] is False
+    assert payload["updated"] == []
+    assert "压缩配置热更新失败" in payload["error"]
+    assert not any("启动" in w for w in payload.get("warnings", []))

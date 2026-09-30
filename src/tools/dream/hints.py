@@ -309,3 +309,134 @@ async def collect_self_candidates(all_buckets: list, window_hours: int) -> SelfR
         rt.logger.warning(f"Dream self candidate collisions failed: {e}")
 
     return review
+
+
+# ---------------------------------------------------------------- 重放 / 当时的感觉
+# 睡眠真正的工作是把新的和旧的**重放**到一起（系统巩固）。上游的 connection hint 只看
+# 最近 48h 内部最像的一对；这里给每条最近的事配一条更早的（≥ REPLAY_MIN_GAP_DAYS 天前、
+# 相似 > REPLAY_MIN_SIM），像在哪、是不是一回事，不替模型说。config.dream.replay_slots，0 关。
+_REPLAY_MIN_SIM = 0.6
+_REPLAY_MIN_GAP_DAYS = 14
+_REPLAY_POOL_RECENT = 400
+_FEEL_PROMPT_AROUSAL = 0.6
+
+
+async def build_replay_hint(recent: list, all_buckets: list) -> str:
+    runtime_config = rt.config if isinstance(rt.config, dict) else {}
+    try:
+        slots = int((runtime_config.get("dream", {}) or {}).get("replay_slots", 0) or 0)
+    except (TypeError, ValueError):
+        slots = 0
+    if slots <= 0 or not recent:
+        return ""
+    engine = rt.embedding_engine
+    if not (engine and getattr(engine, "enabled", False)):
+        return ""
+    from datetime import timedelta
+    from ombrebrain.policy.surfacing import SurfacePolicyVM
+    from utils import parse_iso_datetime
+    policy = SurfacePolicyVM.default()
+    recent_ids = {b["id"] for b in recent}
+
+    def _created(b):
+        try:
+            return parse_iso_datetime(str((b.get("metadata") or {}).get("created") or ""))
+        except (ValueError, TypeError):
+            return None
+
+    pool = []
+    for b in all_buckets:
+        meta = b.get("metadata") or {}
+        if b["id"] in recent_ids or is_letter_bucket(b):
+            continue
+        if str(meta.get("type") or "dynamic") not in ("dynamic", "gist", "recollection", "learn"):
+            continue
+        if not policy.evaluate_bucket(b, mode="dream").allowed:
+            continue
+        if parse_bool(meta.get("protected"), default=False) or parse_bool(meta.get("pinned"), default=False):
+            continue
+        c = _created(b)
+        if c is None:
+            continue
+        pool.append((c, b))
+    pool.sort(key=lambda x: x[0], reverse=True)
+    pool = pool[:_REPLAY_POOL_RECENT]
+    if not pool:
+        return ""
+    pool_emb = {}
+    for _, b in pool:
+        try:
+            emb = await engine.get_embedding(b["id"])
+        except Exception:
+            emb = None
+        if emb is not None:
+            pool_emb[b["id"]] = emb
+    lines = []
+    used = set()
+    for b in recent[:slots]:
+        rc = _created(b)
+        try:
+            remb = await engine.get_embedding(b["id"])
+        except Exception:
+            remb = None
+        if remb is None or rc is None:
+            continue
+        best, best_sim = None, _REPLAY_MIN_SIM
+        for c, old in pool:
+            if old["id"] in used or old["id"] not in pool_emb:
+                continue
+            if (rc - c) < timedelta(days=_REPLAY_MIN_GAP_DAYS):
+                continue
+            sim = engine._cosine_similarity(remb, pool_emb[old["id"]])
+            if sim > best_sim:
+                best, best_sim = old, sim
+        if best is None:
+            continue
+        used.add(best["id"])
+        old_meta = best.get("metadata") or {}
+        old_text = strip_wikilinks(str(best.get("content") or "")).replace("\n", " ")[:160]
+        old_day = str(old_meta.get("created") or "")[:10]
+        lines.append(
+            f"· [{(b.get('metadata') or {}).get('name', b['id'])}] ↔ "
+            f"{old_day} [{old_meta.get('name', best['id'])}] {best['id']}（相似 {best_sim:.2f}）：{old_text}"
+        )
+    if not lines:
+        return ""
+    return (
+        "\n=== 重放：最近的事和更早的事摆在一起 ===\n"
+        "睡觉的时候新的和旧的会碰到一起。下面每行左边是最近的，右边是更早的一件。"
+        "像在哪、是不是一回事、有没有什么在反复——不替你说。\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
+def build_feel_prompt(recent: list) -> str:
+    """config.dream.feel_prompt=true：对 arousal 高、还没写过感受的近期事件，只摆一个问题。
+    不从对话里抽情绪替它写（那会加戏）；写不写它自己定。rule.md 4 / 7。"""
+    runtime_config = rt.config if isinstance(rt.config, dict) else {}
+    if not parse_bool((runtime_config.get("dream", {}) or {}).get("feel_prompt"), default=False):
+        return ""
+    lines = []
+    for b in recent:
+        meta = b.get("metadata") or {}
+        if str(meta.get("type") or "dynamic") not in ("dynamic", "learn"):
+            continue
+        if parse_bool(meta.get("digested"), default=False):
+            continue
+        try:
+            arousal = float(meta.get("arousal") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if arousal < _FEEL_PROMPT_AROUSAL:
+            continue
+        lines.append(f"· [{meta.get('name', b['id'])}] {b['id']}（A{arousal:.1f}）")
+    if not lines:
+        return ""
+    return (
+        "\n=== 当时的感觉 ===\n"
+        "这几件动静大，你还没写过当时的感觉。有就用 hold(content=\"...\", feel=True, source_bucket=\"id\") 写一句；"
+        "没有就没有，大多数时候是没有。\n"
+        + "\n".join(lines)
+        + "\n"
+    )

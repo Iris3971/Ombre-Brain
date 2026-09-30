@@ -511,8 +511,8 @@ delete-to-archive 才触发依赖 Claim 的级联失效。支持桶删除或受�
   或其他工具旁路注入。
 - 工具支持 bounded query 和 aspect 过滤；无 query 时只返回受预算约束的 `core` 条目。
 - 单次返回上限为 160 tokens 且最多 6 条。
-- 有 query 时按规范化子串/双字符匹配分数排序并去掉零分项；无 query 时只选 `core`。达到条数或
-  约 160 token 预算后停止追加，不使用“用户价值分”或人格评分。
+- 有 query 时按规范化子串/双字符匹配分数排序并去掉零分项；无 query 时只选 `core`。达到条数后
+  停止；单条放不下约 160 token 余量时跳过该条、继续尝试后面的，不使用“用户价值分”或人格评分。
 - 返回**已生效 Claim 的正文**；Claim ID、aspect、证据、收据和生效时间都不进入 MCP 响应。
 - 服务端只选择 `formal + clear + current + callable` 的 Claim。
 - 结果数量和 token 均受硬上限约束。

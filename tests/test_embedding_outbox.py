@@ -1239,3 +1239,273 @@ def test_embedding_info_exposes_outbox_status(monkeypatch):
 
     assert payload["api_format"] == "ollama"
     assert payload["outbox"] == {"pending": 2, "retrying": 1}
+
+
+_POISON_CONTENT = "这条内容永远生成不出向量"
+
+
+class PoisonEngine(RecordingEngine):
+    def __init__(self):
+        super().__init__()
+        self.cured = False
+
+    async def generate_and_store(self, bucket_id, content):
+        self.calls.append((bucket_id, content))
+        if content == _POISON_CONTENT and not self.cured:
+            return False
+        self.hashes[bucket_id] = content_hash(content)
+        return True
+
+    def poison_calls(self):
+        return sum(1 for _bid, content in self.calls if content == _POISON_CONTENT)
+
+
+async def _poison_rounds(manager, outbox, rounds):
+    # 每轮写一条正常记忆，等毒条目退避到期，把到期的全部处理掉。
+    for index in range(rounds):
+        await manager.create(content=f"正常记忆 {index} {time.time_ns()}")
+        await asyncio.sleep(0.03)
+        while await outbox.process_once():
+            pass
+
+
+async def _abandoned_poison(tmp_path, **embedding):
+    config = _config(tmp_path, circuit_failure_threshold=99, **embedding)
+    engine = PoisonEngine()
+    manager = BucketManager(config, embedding_engine=engine)
+    outbox = EmbeddingOutbox(config, manager, engine)
+    manager.attach_embedding_outbox(outbox)
+    outbox._running = True
+    poison_id = await manager.create(content=_POISON_CONTENT)
+    await _poison_rounds(manager, outbox, 6)
+    return engine, manager, outbox, poison_id
+
+
+@pytest.mark.asyncio
+async def test_poison_item_is_abandoned_only_after_failing_while_others_succeed(
+    tmp_path,
+):
+    engine, manager, outbox, poison_id = await _abandoned_poison(
+        tmp_path, abandon_after_failures=3
+    )
+
+    status = outbox.status()
+    assert status["abandoned"] == 1
+    assert status["abandoned_ids"] == [poison_id]
+    assert status["pending"] == 0
+    assert status["retrying"] == 0
+    assert status["abandon_after_failures"] == 3
+    calls = engine.poison_calls()
+    assert calls >= 4
+
+    await _poison_rounds(manager, outbox, 3)
+    assert engine.poison_calls() == calls
+    assert await outbox.reconcile(include_archive=True) == 0
+    assert outbox.is_pending(poison_id) is True
+    assert await outbox.wait_until_idle(timeout=0.2) is True
+    bucket = await manager.get(poison_id)
+    assert bucket["content"].strip() == _POISON_CONTENT
+
+    persisted = json.loads(
+        (tmp_path / "vault" / ".embedding_outbox.json").read_text("utf-8")
+    )
+    item = persisted["items"][poison_id]
+    assert item["content_abandoned_at"]
+    assert item["content_attempts"] == calls
+    assert item["content_strikes"] == 3
+    restarted = EmbeddingOutbox(_config(tmp_path), manager, engine)
+    assert restarted.status()["abandoned"] == 1
+    assert await restarted.process_once() is False
+
+
+@pytest.mark.asyncio
+async def test_provider_wide_failure_never_abandons(tmp_path):
+    config = _config(
+        tmp_path, abandon_after_failures=2, circuit_failure_threshold=99
+    )
+    engine = FailingEngine()
+    manager = BucketManager(config, embedding_engine=engine)
+    outbox = EmbeddingOutbox(config, manager, engine)
+    manager.attach_embedding_outbox(outbox)
+    outbox._running = True
+    ids = [await manager.create(content=f"全部失败 {i}") for i in range(3)]
+
+    for _ in range(8):
+        await asyncio.sleep(0.03)
+        while await outbox.process_once():
+            pass
+
+    status = outbox.status()
+    assert status["abandoned"] == 0
+    assert status["pending"] == 3
+    assert all(outbox._items[bid]["content_attempts"] >= 6 for bid in ids)
+
+
+@pytest.mark.asyncio
+async def test_default_config_never_abandons_poison_item(tmp_path):
+    engine, manager, outbox, poison_id = await _abandoned_poison(tmp_path)
+
+    status = outbox.status()
+    assert status["abandoned"] == 0
+    assert status["pending"] == 1
+    assert outbox.pending_ids() == {poison_id}
+    calls = engine.poison_calls()
+    assert calls >= 6
+    await _poison_rounds(manager, outbox, 2)
+    assert engine.poison_calls() > calls
+
+
+@pytest.mark.asyncio
+async def test_content_update_revives_abandoned_item(tmp_path):
+    engine, manager, outbox, poison_id = await _abandoned_poison(
+        tmp_path, abandon_after_failures=3
+    )
+    assert outbox.status()["abandoned"] == 1
+
+    await manager.update(poison_id, content="改过之后的正常内容")
+    status = outbox.status()
+    assert status["abandoned"] == 0
+    assert status["pending"] == 1
+    item = outbox._items[poison_id]
+    assert not item.get("content_abandoned_at")
+    assert item["content_strikes"] == 0
+
+    while await outbox.process_once():
+        pass
+    assert outbox.is_pending(poison_id) is False
+    assert engine.hashes[poison_id] == content_hash("改过之后的正常内容")
+
+
+@pytest.mark.asyncio
+async def test_retry_now_revives_abandoned_item(tmp_path):
+    engine, manager, outbox, poison_id = await _abandoned_poison(
+        tmp_path, abandon_after_failures=3
+    )
+    engine.cured = True
+
+    assert outbox.retry_now() >= 1
+    item = outbox._items[poison_id]
+    assert not item.get("content_abandoned_at")
+    assert item["content_attempts"] == 0
+    assert outbox.status()["pending"] == 1
+
+    while await outbox.process_once():
+        pass
+    assert outbox.is_pending(poison_id) is False
+    assert poison_id in engine.hashes
+
+
+@pytest.mark.asyncio
+async def test_new_engine_revives_abandoned_item(tmp_path):
+    _engine, manager, outbox, poison_id = await _abandoned_poison(
+        tmp_path, abandon_after_failures=3
+    )
+
+    recovered = RecordingEngine()
+    manager.embedding_engine = recovered
+    outbox.set_embedding_engine(recovered)
+    assert outbox.status()["abandoned"] == 0
+    assert outbox.status()["pending"] == 1
+
+    while await outbox.process_once():
+        pass
+    assert outbox.is_pending(poison_id) is False
+    assert recovered.calls == [(poison_id, _POISON_CONTENT)]
+
+
+@pytest.mark.asyncio
+async def test_v3_file_without_abandon_fields_still_processes(tmp_path):
+    bucket_id = "v3-legacy"
+    content = "written before abandon fields existed"
+
+    class Manager:
+        async def get(self, requested_id):
+            assert requested_id == bucket_id
+            return {"id": bucket_id, "content": content, "metadata": {}}
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    stamp = "2026-01-01T00:00:00"
+    (vault / ".embedding_outbox.json").write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "items": {
+                    bucket_id: {
+                        "content_hash": content_hash(content),
+                        "content_attempts": 7,
+                        "content_next_attempt_at": 0.0,
+                        "content_last_attempt_at": stamp,
+                        "content_last_error": "old failure",
+                        "content_queued_at": stamp,
+                        "queued_at": stamp,
+                        "updated_at": stamp,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    engine = RecordingEngine()
+    outbox = EmbeddingOutbox(
+        _config(tmp_path, abandon_after_failures=1), Manager(), engine
+    )
+    status = outbox.status()
+    assert status["abandoned"] == 0
+    assert status["pending"] == 1
+    assert await outbox.process_once() is True
+    assert engine.calls == [(bucket_id, content)]
+    assert outbox.pending_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_meaning_does_not_block_content(tmp_path):
+    bucket_id = "two-components"
+    meaning = "provider rejects this meaning"
+    contents = {"other": "an unrelated healthy memory"}
+
+    class Manager:
+        async def get(self, requested_id):
+            return {
+                "id": requested_id,
+                "content": contents.get(requested_id, "two content"),
+                "metadata": {"meaning": [meaning]},
+            }
+
+    class ComponentEngine(RecordingEngine):
+        def __init__(self):
+            super().__init__()
+            self.meaning_calls = []
+
+        async def generate_and_store_meaning(self, requested_id, text):
+            self.meaning_calls.append((requested_id, text))
+            return False
+
+    engine = ComponentEngine()
+    outbox = EmbeddingOutbox(
+        _config(tmp_path, abandon_after_failures=1, circuit_failure_threshold=99),
+        Manager(),
+        engine,
+    )
+    outbox.enqueue_meaning(bucket_id, meaning)
+    assert await outbox.process_once() is True
+    outbox.enqueue("other", contents["other"])
+    assert await outbox.process_once() is True
+    await asyncio.sleep(0.03)
+    assert await outbox.process_once() is True
+    assert len(engine.meaning_calls) == 2
+    status = outbox.status()
+    assert status["abandoned"] == 1
+    assert status["pending"] == 0
+
+    outbox.enqueue(bucket_id, "two content")
+    assert outbox.status()["pending"] == 1
+    assert await outbox.process_once() is True
+    assert (bucket_id, "two content") in engine.calls
+    assert await outbox.process_once() is False
+    assert len(engine.meaning_calls) == 2
+    remaining = outbox._items[bucket_id]
+    assert "content_hash" not in remaining
+    assert remaining["meaning_abandoned_at"]
+    assert outbox.status()["pending"] == 0

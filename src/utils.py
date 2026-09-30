@@ -452,6 +452,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
             "circuit_failure_threshold": 3,
             "circuit_base_seconds": 30,
             "circuit_max_seconds": 600,
+            "abandon_after_failures": 0,
         },
     }
 

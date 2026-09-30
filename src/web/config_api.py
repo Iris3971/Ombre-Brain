@@ -72,23 +72,23 @@ _MAX_PROVIDER_KEY_CHARS = 8192
 _MAX_PROVIDER_URL_CHARS = 2048
 _MAX_PROVIDER_FORMAT_CHARS = 64
 _MAX_ENV_VALUE_CHARS = 8192
+_JS_MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 
 def _bounded_config_int(value, field: str, low: int, high: int) -> int:
+    constraint = f"in [{low},{high}]"
     if isinstance(value, bool):
-        raise ValueError(f"{field} must be an integer in [{low},{high}]")
+        raise ValueError(f"{field} must be an integer {constraint}")
     try:
         parsed = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            f"{field} must be an integer in [{low},{high}]"
-        ) from exc
+        raise ValueError(f"{field} must be an integer {constraint}") from exc
     if isinstance(value, float) and (
         not math.isfinite(value) or value != parsed
     ):
-        raise ValueError(f"{field} must be an integer in [{low},{high}]")
-    if not low <= parsed <= high:
-        raise ValueError(f"{field} must be in [{low},{high}]")
+        raise ValueError(f"{field} must be an integer {constraint}")
+    if parsed < low or parsed > high:
+        raise ValueError(f"{field} must be {constraint}")
     return parsed
 
 
@@ -271,6 +271,15 @@ def register(mcp) -> None:
                 status_code=500,
             )
         dehy = sh.config.get("dehydration", {})
+        try:
+            import_max_tokens = _bounded_config_int(
+                dehy.get("import_max_tokens", 8192),
+                "dehydration.import_max_tokens",
+                1,
+                _JS_MAX_SAFE_INTEGER,
+            )
+        except ValueError:
+            import_max_tokens = 8192
         emb = sh.config.get("embedding", {})
         runtime_network_security = _runtime_network_security(
             desired["mcp_require_auth"]
@@ -283,6 +292,7 @@ def register(mcp) -> None:
                 "base_url": dehy.get("base_url", ""),
                 "api_key_masked": masked_key,
                 "max_tokens": dehy.get("max_tokens", 1024),
+                "import_max_tokens": import_max_tokens,
                 "temperature": dehy.get("temperature", 0.1),
                 "api_format": dehy.get("api_format", "openai_compat"),
                 "timeout_seconds": dehy.get("timeout_seconds", 60),
@@ -407,6 +417,13 @@ def register(mcp) -> None:
                     "dehydration.max_tokens",
                     128,
                     8192,
+                )
+            if "import_max_tokens" in dehydration_payload:
+                dehydration_payload["import_max_tokens"] = _bounded_config_int(
+                    dehydration_payload["import_max_tokens"],
+                    "dehydration.import_max_tokens",
+                    1,
+                    _JS_MAX_SAFE_INTEGER,
                 )
             if "temperature" in dehydration_payload:
                 dehydration_payload["temperature"] = _bounded_config_float(
@@ -616,6 +633,7 @@ def register(mcp) -> None:
             "model",
             "base_url",
             "max_tokens",
+            "import_max_tokens",
             "temperature",
             "timeout_seconds",
             "api_format",
@@ -643,7 +661,7 @@ def register(mcp) -> None:
         if "dehydration" in body:
             d = dehydration_payload
             dehy = sh.config.setdefault("dehydration", {})
-            for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
+            for key in ("model", "base_url", "max_tokens", "import_max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
                 if key in d:
                     dehy[key] = d[key]
                     updated.append(f"dehydration.{key}")
@@ -654,6 +672,8 @@ def register(mcp) -> None:
             sh.dehydrator.model = dehy.get("model", sh.dehydrator.model)
             sh.dehydrator.base_url = dehy.get("base_url", sh.dehydrator.base_url)
             sh.dehydrator.max_tokens = int(dehy.get("max_tokens") or sh.dehydrator.max_tokens)
+            if "import_max_tokens" in d:
+                sh.dehydrator.import_max_tokens = int(d["import_max_tokens"])
             configured_temperature = dehy.get("temperature")
             if configured_temperature is not None:
                 sh.dehydrator.temperature = float(configured_temperature)
@@ -772,7 +792,7 @@ def register(mcp) -> None:
                     if not isinstance(sc_dehy, dict):
                         sc_dehy = {}
                         save_config["dehydration"] = sc_dehy
-                    for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
+                    for key in ("model", "base_url", "max_tokens", "import_max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
                         if key in dehydration_payload:
                             sc_dehy[key] = dehydration_payload[key]
                     # Never persist api_key to yaml (use env var)
@@ -1171,6 +1191,15 @@ def register(mcp) -> None:
         "AI_NAME":                 {"group": "identity", "sensitive": False, "in_memory": None},
     }
 
+    # 会在启动时压过 dashboard 字段的旧变量名（依据 utils.load_config：OMBRE_API_KEY /
+    # OMBRE_BASE_URL 在新名缺席时兜底写入 dehydration；OMBRE_COMPRESS_API_FORMAT 在
+    # OMBRE_COMPRESS_FORMAT 之后应用，两者都在时旧名生效）。只用来判断字段是否被接管。
+    _ENV_CONFIG_LEGACY_ALIASES: dict[str, tuple[str, ...]] = {
+        "OMBRE_COMPRESS_API_KEY": ("OMBRE_API_KEY",),
+        "OMBRE_COMPRESS_BASE_URL": ("OMBRE_BASE_URL",),
+        "OMBRE_COMPRESS_FORMAT": ("OMBRE_COMPRESS_API_FORMAT",),
+    }
+
     _ENV_CONFIG_NOTE = {
         "compress": "改完即时生效（进程内 sh.config 已更新），同时写 config.yaml 持久化（重启后仍有效）。",
         "embed": "API key / base_url / model 立即更新进程内 config；backend 切换请用「切换 / 重算所有 embedding…」按钮。",
@@ -1241,6 +1270,8 @@ def register(mcp) -> None:
           业务引擎热更新失败，会同时出现在 warnings 中；
         - persisted：已成功落盘、重启后仍会保留的变量名；
         - partial / warnings：运行时已生效但落盘失败，或部分字段未应用。
+          warnings 也可能包含「字段由启动时的环境变量接管、重启后会被覆盖」的
+          提示；这种情况本次保存本身是完整的，partial 仍为 False。
         """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
@@ -1453,6 +1484,30 @@ def register(mcp) -> None:
                 else "当前进程运行时与持久化配置均已更新。"
             ),
         }
+
+        # 启动时环境变量（含旧名）接管的字段：load_config 每次启动都会用它们盖掉
+        # config.yaml，本次保存会在重启/重建容器后失效。放在 partial 算完之后追加，
+        # 只提示、不改 ok/partial；只写变量名，不写值（多半是密钥）。
+        from utils import BOOT_ENV_CONFIG
+        shadowed: list[str] = []
+        for var in written:
+            aliases = [
+                a for a in _ENV_CONFIG_LEGACY_ALIASES.get(var, ())
+                if a in BOOT_ENV_CONFIG
+            ]
+            if aliases:
+                via = "及" if var in BOOT_ENV_CONFIG else "经"
+                shadowed.append(f"{var}（{via} {'、'.join(aliases)}）")
+            elif var in BOOT_ENV_CONFIG:
+                shadowed.append(var)
+        if shadowed:
+            warnings.append(
+                f"以下字段由启动时的环境变量接管（{', '.join(shadowed)}）："
+                "本次保存已在当前进程生效，但环境变量优先级更高，重启或重建容器后"
+                "会被它覆盖。要让此面板成为唯一来源，请到部署环境（平台环境变量，"
+                "或 .env / docker compose）删除这些变量后重建容器。"
+            )
+
         if warnings:
             response["warnings"] = warnings
         if not written:

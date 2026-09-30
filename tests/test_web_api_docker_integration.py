@@ -304,8 +304,12 @@ def test_desktop_management_api_first_run_and_authenticated_flow():
         # 要的就是 404。3.2.0–3.3.0 期间它是信件连接器，那时 GET 拿的是 406
         # （streamable-http 只接受 POST + JSON Accept）。
         assert client.get("/mcp-extra").status_code == 404
-        # 主连接器仍在，GET 拿 406 而不是 404
-        assert client.get("/mcp").status_code == 406
+        # 主连接器仍在：无状态模式下 GET 回 405（Allow: POST），不是 404。
+        # 以前这里是 406（Accept 不含 event-stream 时），#106 起由
+        # MCPStatelessGetShim 统一回 405，不再挂空 SSE 流。
+        mcp_get = client.get("/mcp")
+        assert mcp_get.status_code == 405
+        assert "POST" in mcp_get.headers["allow"]
 
         invalid_transport = client.post(
             "/api/transport",

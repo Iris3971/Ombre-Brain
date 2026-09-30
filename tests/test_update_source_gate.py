@@ -145,13 +145,25 @@ def test_legacy_archive_compatibility_requires_284_release_lock():
     Windows 都没有。缺了它 `utils.get_tzinfo()` 会静默兜底成固定 +08:00——
     配 America/New_York 的用户拿到东八区的解锁时间，且没有任何提示。
     详见 3.6.1 的 CHANGELOG。
+
+    2026-09-30（testing）：pip-audit 报 pyjwt==2.13.0 十个 CVE（CVE-2026-102265 等，无 fix 版本，
+    只能升到 2.14.0，而 2.14.0 发布于 2026-09-11，旧快照 2026-08-01 看不见它），于是把
+    UV_EXCLUDE_NEWER 推进到 2026-09-12 重新生成两份锁。评估结论是这次和 2026-08-09 那次同类，
+    是一次明确接受的破坏性变更，不是纯增量：
+
+    - 发布锁动了 31 个包，其中 openai 2.52.0→3.13.0 是大版本（httpx2 系列跟着进来，tqdm/distro/
+      colorama 随之退出），mcp 1.29.0→1.30.0，starlette 1.3.1→1.6.0，sse-starlette 3.4.6→3.4.11，
+      pydantic-settings 2.14.2→2.15.0，其余是补丁级。
+    - 旧更新器仍会判「依赖变了」并触发一次依赖安装；v2.8.4 之前、没有 lock 感知回退的实例，
+      这次热更新后同样可能走不通旧的 legacy 回退路径，需要手动升级一次——和 08-09 一样。
+    - 新锁在推进当天跑 pip-audit 无已知漏洞；全量测试见 CI。
     """
     repo_root = Path(meta.__file__).resolve().parents[2]
     lock_bytes = (repo_root / "requirements.lock.txt").read_bytes()
     normalized = lock_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 
     assert hashlib.sha256(normalized).hexdigest() == (
-        "ae0255bd41e5ceb45694244017a9b0b2dc1e4c445ab027cec1f7183ad969700a"
+        "02af798b5128d08352c53ca6ae387bec223763ea6330c82c36a48cd2011a5882"
     ), (
         "requirements.lock.txt 已变化：确认这次变化是否会影响还没升级过的旧版"
         "热更新器（尤其 v2.8.4 之前、缺少 lock 感知回退逻辑的实例），评估后再把"
@@ -303,7 +315,7 @@ def test_runtime_lock_probe_accepts_repository_release_lock_syntax(monkeypatch):
     lock = (repo_root / "requirements.lock.txt").read_bytes()
 
     assert meta._runtime_satisfies_locked_versions(lock) is True
-    assert b"mcp==1.29.0" in captured["content"]
+    assert b"mcp==1.30.0" in captured["content"]
 
 
 def test_runtime_lock_probe_nonzero_result_fails_closed_and_cleans_temp(

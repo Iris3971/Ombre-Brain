@@ -23,7 +23,13 @@ from typing import Optional
 from ..i import record_dream_offer, record_dream_pass
 from .. import _runtime as rt
 from .candidates import collect_candidates
-from .hints import build_connection_hint, build_crystal_hint, collect_self_candidates
+from .hints import (
+    build_connection_hint,
+    build_crystal_hint,
+    build_feel_prompt,
+    build_replay_hint,
+    collect_self_candidates,
+)
 from .output import format_dream_output
 
 
@@ -57,6 +63,17 @@ async def dispatch(
 
     connection_hint = await build_connection_hint(recent)
     crystal_hint = await build_crystal_hint(all_buckets)
+    # 重放（新旧摆一起）+ 当时的感觉（只摆问题）。都是材料，不判断。
+    try:
+        replay_hint = await build_replay_hint(recent, all_buckets)
+    except Exception as exc:
+        rt.logger.warning(f"Dream replay hint failed / 重放段没算出来: {exc}")
+        replay_hint = ""
+    try:
+        feel_prompt = build_feel_prompt(recent)
+    except Exception as exc:
+        rt.logger.warning(f"Dream feel prompt failed: {exc}")
+        feel_prompt = ""
 
     final_text = await format_dream_output(
         recent=recent,
@@ -65,6 +82,7 @@ async def dispatch(
         connection_hint=connection_hint,
         crystal_hint=crystal_hint,
         self_review=self_review,
+        extra_hints=[replay_hint, feel_prompt],
     )
 
     # them 追加在末尾，独立通道，不进融合打分（rule.md 13.3）。

@@ -15,6 +15,9 @@ _github_sync_loop / _restart_github_auto_task 也读 sh.github_sync_instance，
 
 import asyncio
 import os
+from pathlib import PurePosixPath
+import stat
+import tempfile
 import time
 import uuid
 import zipfile
@@ -26,6 +29,143 @@ from . import _shared as sh
 
 logger = sh.logger
 _import_lock = asyncio.Lock()
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    """Windows 上 lstat 结果带 reparse point 属性（junction 等）即为真；其他平台恒为假。"""
+    return bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _windows_name_rules() -> bool:
+    """当前平台是否按 Windows 的文件名规则还原（设备名、冒号、结尾空格或点都会变成别名）。
+
+    单独成函数是为了测试能切换平台语义。
+    """
+    return os.name == "nt"
+
+
+def _case_insensitive_root(root: str) -> bool:
+    """恢复根目录所在文件系统是否不分大小写（Windows 恒为真，其他平台按根目录名探测）。
+
+    探测不出来（根目录名里没有字母、换了大小写的路径读不到）就当分大小写：
+    主要部署在 Linux，备份又是在同一个文件系统上走出来的，那里不会有只差大小写的两份。
+    """
+    if _windows_name_rules():
+        return True
+    root_abs = os.path.realpath(root)
+    head, base = os.path.split(root_abs)
+    swapped = base.swapcase()
+    if not base or swapped == base:
+        return False
+    try:
+        return os.path.samefile(root_abs, os.path.join(head, swapped))
+    except OSError:
+        return False
+
+
+def _safe_rollback_member(name: str, *, windows_rules: bool) -> tuple[str, ...]:
+    """把本地备份里的一个成员名规整成路径分段。
+
+    越界（空名、NUL、绝对路径、. 和 ..）在所有平台都拒绝；设备名、冒号、
+    结尾空格或点只在 Windows 上会变成别名，只在 windows_rules 为真时拒绝——
+    Linux 上用户建的域可以叫 aux，sanitize_name 截断后目录名结尾也可能是空格，
+    那些都是合法名字，不能让它们一票否决整包还原。
+    """
+
+    raw = str(name or "")
+    if not raw or "\x00" in raw:
+        raise ValueError("空路径或 NUL")
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("/"):
+        raise ValueError("绝对路径")
+    parts = PurePosixPath(normalized).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("路径越界")
+    if not windows_rules:
+        return tuple(parts)
+    reserved = {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
+    reserved.update({f"COM{i}" for i in range(1, 10)})
+    reserved.update({f"LPT{i}" for i in range(1, 10)})
+    for part in parts:
+        if ":" in part or part.endswith((" ", ".")):
+            raise ValueError("非便携路径")
+        if part.split(".", 1)[0].rstrip(" ").upper() in reserved:
+            raise ValueError("Windows 设备名")
+    return tuple(parts)
+
+
+def _prepare_rollback_target(root: str, parts: tuple[str, ...]) -> str:
+    """逐级建出普通目录作父目录；根目录以下任何一级是符号链接或 reparse point 都拒绝。"""
+
+    # 根目录是部署时配置的 buckets_dir，本身是符号链接/junction 的部署
+    # （例如把库放在别的盘）原来能回滚，这里先解析成真实路径再往下查，
+    # 和 storage/backup_archive 里 Path(buckets_dir).resolve() 的做法一致；
+    # 只有根目录以下的链接才算越界。
+    root_abs = os.path.realpath(root)
+    try:
+        root_info = os.stat(root_abs)
+    except OSError as exc:
+        raise ValueError("恢复根目录不可读") from exc
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("恢复根目录不是目录")
+
+    parent = root_abs
+    for part in parts[:-1]:
+        parent = os.path.join(parent, part)
+        try:
+            os.mkdir(parent)
+        except FileExistsError:
+            pass
+        info = os.lstat(parent)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or _is_reparse_point(info)
+            or not stat.S_ISDIR(info.st_mode)
+        ):
+            raise ValueError("恢复路径包含符号链接或 reparse point")
+
+    target = os.path.join(root_abs, *parts)
+    if os.path.lexists(target):
+        info = os.lstat(target)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or _is_reparse_point(info)
+            or not stat.S_ISREG(info.st_mode)
+        ):
+            raise ValueError("恢复目标不是常规文件")
+    return target
+
+
+def _restore_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, target: str) -> None:
+    """把一个成员分块写进同目录临时文件，核对长度并 fsync 后原子替换目标。"""
+
+    parent = os.path.dirname(target)
+    fd, temporary = tempfile.mkstemp(prefix=".ob-rollback-", dir=parent)
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as dst, zf.open(info) as src:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > info.file_size:
+                    raise ValueError("备份成员实际长度超过声明")
+                dst.write(chunk)
+            if written != info.file_size:
+                raise ValueError("备份成员实际长度与声明不一致")
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
 
 try:
     from github_sync import GitHubSync  # type: ignore
@@ -93,20 +233,87 @@ def _rollback_from_backup(buckets_dir: str, backup_zip: str) -> dict:
     失败: list[str] = []
     try:
         with zipfile.ZipFile(backup_zip) as z:
-            成员 = [n for n in z.namelist() if not n.endswith("/")]
-            for name in 成员:
-                目标 = os.path.abspath(os.path.join(buckets_dir, name))
-                # 防目录穿越：备份是本地生成的，但它也可能被人动过手脚
-                if not 目标.startswith(os.path.abspath(buckets_dir) + os.sep):
-                    失败.append(f"{name}: 路径越界")
+            # 先全包预检，再动任何本地文件。这样一个恶意后缀成员
+            # 不会让前面已经通过的成员先部分落盘。
+            planned: list[tuple[zipfile.ZipInfo, tuple[str, ...]]] = []
+            seen: set[str] = set()
+            windows_rules = _windows_name_rules()
+            # 只差大小写的两个成员，只在不分大小写的文件系统上才会落到同一个文件；
+            # Linux 上它们是两份不同的记忆，都要还原。
+            fold_case = _case_insensitive_root(buckets_dir)
+
+            def _key(parts: tuple[str, ...]) -> str:
+                joined = "/".join(parts)
+                return joined.casefold() if fold_case else joined
+
+            for info in z.infolist():
+                if info.is_dir() or info.filename.endswith("/"):
                     continue
                 try:
-                    os.makedirs(os.path.dirname(目标), exist_ok=True)
-                    with z.open(name) as src, open(目标, "wb") as dst:
-                        dst.write(src.read())
+                    parts = _safe_rollback_member(
+                        info.filename, windows_rules=windows_rules
+                    )
+                    key = _key(parts)
+                    if key in seen:
+                        raise ValueError("重复或大小写冲突路径")
+                    seen.add(key)
+                    mode = (info.external_attr >> 16) & 0o170000
+                    if mode in (
+                        stat.S_IFLNK,
+                        stat.S_IFSOCK,
+                        stat.S_IFIFO,
+                        stat.S_IFCHR,
+                        stat.S_IFBLK,
+                    ):
+                        raise ValueError("不安全的备份成员类型")
+                    if info.file_size < 0:
+                        raise ValueError("负数成员长度")
+                    if info.flag_bits & 0x1:
+                        raise ValueError("加密成员")
+                    planned.append((info, parts))
+                except Exception as exc:
+                    失败.append(f"{info.filename}: {exc}")
+
+            # 一个成员不能既是文件、又是另一个成员的父目录；这种冲突与平台无关，
+            # 在建任何父目录之前就整包拒绝。
+            for _info, parts in planned:
+                for index in range(1, len(parts)):
+                    if _key(parts[:index]) in seen:
+                        失败.append(
+                            f"{_info.filename}: 文件/目录前缀冲突"
+                        )
+                        break
+
+            if 失败:
+                return {
+                    "ok": False,
+                    "restored": 0,
+                    "failed": 失败[:10],
+                    "failed_count": len(失败),
+                }
+
+            targets: list[tuple[zipfile.ZipInfo, str]] = []
+            for info, parts in planned:
+                try:
+                    目标 = _prepare_rollback_target(buckets_dir, parts)
+                    targets.append((info, 目标))
+                except Exception as exc:
+                    失败.append(f"{info.filename}: {type(exc).__name__}: {exc}")
+
+            if 失败:
+                return {
+                    "ok": False,
+                    "restored": 0,
+                    "failed": 失败[:10],
+                    "failed_count": len(失败),
+                }
+
+            for info, 目标 in targets:
+                try:
+                    _restore_zip_member(z, info, 目标)
                     还原 += 1
                 except Exception as exc:
-                    失败.append(f"{name}: {type(exc).__name__}")
+                    失败.append(f"{info.filename}: {type(exc).__name__}: {exc}")
     except Exception as exc:
         logger.error(f"[github] rollback failed to open backup: {exc}")
         return {"ok": False, "restored": 还原, "error": f"备份读不开：{type(exc).__name__}"}

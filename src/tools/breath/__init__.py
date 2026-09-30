@@ -150,6 +150,17 @@ async def dispatch(
     default_tokens = int(surfacing_cfg.get("breath_max_tokens") or 20000)
     if max_results <= 0:
         max_results = default_results
+        if (query or "").strip():
+            # 带 query 的检索用 surfacing.search_max_results（没配则同 breath_max_results）。
+            # 09-15 读答实验，她的库（121 桶）里 10 条是顶点：Claude 读 8/10/20 条 = 0.71/0.76/0.72，
+            # DeepSeek 读 5/10/15 条 = 0.68/0.75/0.69。多出来的是同款句子，盖住了要找的那一条。
+            # 无 query 的睁眼浮现走的是配额不是检索，条数不动。
+            try:
+                _sr = int(surfacing_cfg.get("search_max_results") or 0)
+            except (TypeError, ValueError):
+                _sr = 0
+            if _sr > 0:
+                max_results = _sr
     if max_tokens <= 0:
         max_tokens = default_tokens
     max_results = min(max_results, 50)
@@ -203,12 +214,21 @@ async def dispatch(
 
     # --- 无 query：浮现模式 ---
     if not query or not query.strip():
+        # 不带 query 时 valence/arousal 是此刻的心情，只影响排序（见 surface._mood_factor）。
+        # 只在两个坐标都给了（0~1）时才传——不传就是 3.6.11 原样的调用。
+        _kw = {}
+        try:
+            if 0.0 <= float(valence) <= 1.0 and 0.0 <= float(arousal) <= 1.0:
+                _kw = {"mood_valence": float(valence), "mood_arousal": float(arousal)}
+        except (TypeError, ValueError):
+            _kw = {}
         return await _with_deletion_requests(await _with_them(await surface_default(
             max_results=max_results,
             max_tokens=memory_max_tokens,
             tag_filter=tag_filter,
             created_from=created_from,
             created_to=created_to,
+            **_kw,
         )))
 
     # --- 有 query：检索模式 ---

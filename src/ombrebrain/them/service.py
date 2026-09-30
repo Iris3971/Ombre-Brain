@@ -60,6 +60,7 @@ from .models import (
 )
 from .safety import (
     contains_forbidden_subject,
+    forbidden_subject_fields,
     is_relation_label,
     leaks_protected_text,
 )
@@ -638,11 +639,20 @@ class ThemService:
         if len(content) > 500:
             raise ValueError(f"正文不超过 500 字，你给了 {len(content)} 字。")
         if contains_forbidden_subject(content, concept_key, concept_value):
+            # 指名道姓说是哪个字段。笼统地说「这条写不进去」时，模型只会去改
+            # 正文——真机上正文合规、踩线的是 concept_key="personality"，于是
+            # 连续五次重写正文，那个键一次没动。
+            踩线 = forbidden_subject_fields(
+                content=content, concept_key=concept_key, concept_value=concept_value
+            )
+            哪里 = "、".join(踩线) if 踩线 else "这几个字段合起来"
             raise ValueError(
-                "这条写不进去：them 只记这个人本身，不记人格判断、健康财务性与"
-                "亲密这些话题，**也不描述任何关系**——"
-                "「和谁关系怎么样」「对谁意味着什么」都不属于这里。"
-                "改成只讲这个人本身的说法再试。"
+                f"这条写不进去，踩线的是 **{哪里}**（不是整条都不行）：\n"
+                "them 只记这个人本身，不记人格判断、健康财务性与亲密这些话题，"
+                "**也不描述任何关系**——「和谁关系怎么样」「对谁意味着什么」"
+                "都不属于这里。\n"
+                "只改上面点名的那个字段再试；正文没被点名就说明正文本身没问题，"
+                "重写它没有用。"
             )
         if leaks_protected_text(content, protected_texts):
             raise ValueError("这条写不进去：不能照抄记忆原文，用你自己的话写。")
@@ -995,10 +1005,13 @@ class ThemService:
                 if claim.lifecycle != "candidate":
                     continue
                 还差 = max(0, REQUIRED_CONFIRMATIONS - claim.review_date_count)
+                # 依据桶一并给出，理由同 you/service.py 的同名方法。
+                依据 = "、".join(edge.bucket_id for edge in claim.evidence)
                 条目.append(
                     f"- {person.display_name}｜{claim.concept_key}="
                     f"{claim.concept_value}｜{claim.aspect}\n"
                     f"  「{claim.content}」还差 {还差} 个不同的日子\n"
+                    f"  bucket_ids={依据}\n"
                     f"  id={claim.id}"
                 )
         if not 条目:

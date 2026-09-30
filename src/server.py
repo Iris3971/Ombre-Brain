@@ -34,8 +34,9 @@ import logging
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from typing import Optional, Awaitable
+from typing import Annotated, Optional, Awaitable
 import httpx
+from pydantic import BeforeValidator
 
 
 # --- Ensure same-directory modules can be imported ---
@@ -369,14 +370,58 @@ async def _stdio_lifespan(_server):
         await lifecycle.stop()
 
 
+# 握手时交给客户端的一段说明（MCP 协议的 instructions 字段，claude.ai / Hermes 一类客户端会交给模型）。
+# 用途：让「开口之前先 breath()」这类约定不依赖某一个入口的项目指令。config.mcp.instructions 设了才带，空串或没设就不带。
+_MCP_INSTRUCTIONS = ((config.get("mcp") or {}).get("instructions") if isinstance(config, dict) else None) or None
+
+
+def _compact_tool_result_enabled(cfg) -> bool:
+    """config.mcp.compact_tool_result 只认 YAML 布尔 true，其它值（字符串 "true"、1、缺省）一律当关。"""
+    mcp_cfg = cfg.get("mcp") if isinstance(cfg, dict) else None
+    return isinstance(mcp_cfg, dict) and mcp_cfg.get("compact_tool_result") is True
+
+
+# FastMCP 对带返回注解的 `-> str` 工具默认自动判为结构化：同一段文本会再包成
+# {"result": "..."} 放进 structuredContent，content 里还留一份（兼容老客户端），
+# 线上就是两份全文。把整个响应存进历史的客户端会按两份计费。
+# 开了之后所有工具（含动态挂载的 You/Them）只回 content，outputSchema 变 None，
+# content 文本逐字不变。默认关 = 3.6.4 以来的行为。
+# 配置在 import 时读取：改完要重启，已连接的客户端要重新连接（重新 list_tools），
+# 否则沿用旧会话缓存的 outputSchema 的客户端会报「有 output schema 却没有结构化内容」。
+_MCP_COMPACT_TOOL_RESULT = _compact_tool_result_enabled(config)
+
+
+def _use_unstructured_tool_results(target) -> None:
+    """让 target 上此后注册的工具默认不带结构化输出。
+
+    包的是 `_tool_manager.add_tool`：`@mcp.tool()` 经 FastMCP.add_tool 走到这里，
+    you/them 的 tool_gate 也直接调它，一处覆盖全部注册路径。
+    只把没指定（None）的改成 False；显式传了 True/False 的原样透传。
+    """
+    manager = target._tool_manager
+    original_add_tool = manager.add_tool
+
+    def add_tool(fn, *args, structured_output=None, **kwargs):
+        if structured_output is None:
+            structured_output = False
+        return original_add_tool(fn, *args, structured_output=structured_output, **kwargs)
+
+    manager.add_tool = add_tool
+
+
 mcp = FastMCP(
     "Ombre Brain",
     host=_BIND_HOST,
     port=OMBRE_PORT,
     json_response=True,
     stateless_http=True,
+    instructions=_MCP_INSTRUCTIONS,
     lifespan=_stdio_lifespan if config.get("transport", "stdio") == "stdio" else None,
 )
+
+if _MCP_COMPACT_TOOL_RESULT:
+    _use_unstructured_tool_results(mcp)
+    logger.info("[mcp] compact_tool_result on: tools return content only (no structuredContent / outputSchema)")
 
 # 3.4.0：信件并回主链路，`/mcp-extra` 再次退役。
 #
@@ -687,6 +732,21 @@ _tools_runtime.init(
 )
 
 
+# 纯数字桶 id 的入口兜底。
+# 桶 id 是 12 位 hex，约 0.36% 恰好全是数字；客户端把它序列化成 JSON 数字时，
+# pydantic v2 即使在 lax 模式下也不会把 int 转成 str，调用会在进 core 之前被拒。
+# 这里只把 int 转回字符串：bool 和 float 不转（仍按原样被拒，避免 1.5e11 之类
+# 被当成 id）。BeforeValidator 只作用于运行时校验器，对外 schema 仍是 string。
+def _numeric_id_to_str(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return value
+
+
+_BucketIdArg = Annotated[str, BeforeValidator(_numeric_id_to_str)]
+_OptBucketIdArg = Annotated[Optional[str], BeforeValidator(_numeric_id_to_str)]
+
+
 # =============================================================
 # MCP tools — thin registration wrappers
 # MCP 工具 —— 仅注册，实现见 tools/<tool>/
@@ -826,7 +886,7 @@ async def hold(
     importance: Optional[int] = 5,
     pinned: Optional[bool] = False,
     feel: Optional[bool] = False,
-    source_bucket: Optional[str] = "",
+    source_bucket: _OptBucketIdArg = "",
     valence: Optional[float] = -1,
     arousal: Optional[float] = -1,
     why_remembered: Optional[str] = "",
@@ -909,7 +969,7 @@ async def _decide_deletion_request(
 
 @mcp.tool()
 async def trace(
-    bucket_id: str,
+    bucket_id: _BucketIdArg,
     name: Optional[str] = "",
     title: Optional[str] = "",
     domain: Optional[str] = "",
@@ -936,11 +996,11 @@ async def trace(
     restore: Optional[bool] = False,
     old_str: Optional[str] = "",
     new_str: Optional[str] = None,
-    deletion_request_id: Optional[str] = "",
+    deletion_request_id: _OptBucketIdArg = "",
     deletion_decision: Optional[str] = "",
     deletion_ai_reason: Optional[str] = "",
-    unlink: Optional[str] = "",
-    relink: Optional[str] = "",
+    unlink: _OptBucketIdArg = "",
+    relink: _OptBucketIdArg = "",
     relation_type: Optional[str] = "",
     quotes_replace: Optional[list] = None,
     reinforce: Optional[bool] = False,
@@ -1103,7 +1163,7 @@ async def dream(
 
 
 @mcp.tool()
-async def anchor(bucket_id: str) -> str:
+async def anchor(bucket_id: _BucketIdArg) -> str:
     """把指定桶标记为 anchor(坐标系)。anchor 不主动出现在默认 breath，但 query/domain/emotion 命中时仍返回。硬上限 24，已满时拒绝并提示先 release。"""
     return await _with_notice(
         _t_anchor.anchor_set(bucket_id),
@@ -1113,7 +1173,7 @@ async def anchor(bucket_id: str) -> str:
 
 
 @mcp.tool()
-async def release(bucket_id: str) -> str:
+async def release(bucket_id: _BucketIdArg) -> str:
     """解除指定桶的 anchor 标记。桶恢复为普通状态，重新参与默认 breath；pinned 状态保留。"""
     return await _with_notice(
         _t_anchor.anchor_release(bucket_id),
@@ -1136,13 +1196,13 @@ async def pulse(include_archive: Optional[bool] = False) -> str:
 async def plan(
     content: str,
     status: Optional[str] = "active",
-    related_bucket: Optional[str] = "",
+    related_bucket: _OptBucketIdArg = "",
     weight: Optional[float] = 0.5,
     why_remembered: Optional[str] = "",
     window_start: Optional[str] = "",
     window_end: Optional[str] = "",
 ) -> str:
-    """登记一个待办/承诺/未闭环事项。status=active(默认)/resolved/abandoned。related_bucket 可选,关联到某个普通记忆桶。weight=承诺重量 0.0-1.0(默认 0.5),与 importance 区分——importance 表示「多重要」、weight 表示「多重」。why_remembered=登记原因(可选、仅展示)。window_start/window_end 为可选时间窗,接受 YYYY-MM-DD 或 ISO 8601；未写时区按 config timezone。plan 不衰减、不出现在普通 breath,仅在 dream 末尾的 active 段返回;后续 hold/grow 写入新事件时系统只会提示可能已完成,实际关闭必须显式调用 trace(status="resolved")。"""
+    """登记一个待办/承诺/未闭环事项。status=active(默认)/resolved/abandoned。related_bucket 可选,关联到某个普通记忆桶。weight=承诺重量 0.0-1.0(默认 0.5),与 importance 区分——importance 表示「多重要」、weight 表示「多重」。why_remembered=登记原因(可选、仅展示)。window_start/window_end 为可选时间窗,接受 ISO 日期或 ISO 8601 时刻；未写时区按 config timezone。plan 不衰减；带时间窗并关联普通记忆桶的 active plan，可在相关记忆被普通 breath 实际浮现且当前时间落窗时随附出现；active plan 仍会在 dream 末尾集中返回。后续 hold/grow 写入新事件时系统只会提示可能已完成,实际关闭必须显式调用 trace(status="resolved")。"""
     return await _with_notice(
         _t_plan.plan_create(
             content=content, status=status, related_bucket=related_bucket,
@@ -1204,7 +1264,7 @@ user_name 可选;ai_name 可选(默认取环境变量 AI_NAME,回退 \"AI\");tit
 
 @mcp.tool()
 async def letter_lock_update(
-    letter_id: str,
+    letter_id: _BucketIdArg,
     lock_type: str,
     unlock_date: Optional[str] = "",
 ) -> str:
@@ -1273,8 +1333,8 @@ async def I(
     aspect: Optional[str] = "",
     read: Optional[bool] = False,
     limit: Optional[int] = 20,
-    promote: Optional[str] = "",
-    supersedes: Optional[str] = "",
+    promote: _OptBucketIdArg = "",
+    supersedes: _OptBucketIdArg = "",
 ) -> str:
     """写下或读取自我认知。I 是沉淀物不是日记：content=一个「我觉得……」，先落成一条普通记忆（候选），会浮现也会衰减，每次 dream 都跟相关记忆摆在一起碰撞。aspect=维度:nature(本质)/values(看重的)/patterns(规律)/limits(局限)/becoming(变化方向)/uncertainty(不确定的)/stance(立场)(可选)。read=True 或全空=读正式条目+待沉淀候选。limit=返回条数上限(默认 20)。promote=候选桶ID，被 3 次不同日期的 dream 见证后才能升级成正式条目（可同时传 content 用提炼后的措辞）。supersedes=正式I条目ID，表示这条新认识要取代它：旧条目立刻不再作为当前信念读出去（一个字不删，随时可查，质疑撤了它就回来），而新的仍要照常攒够见证；只能在同一 aspect 内取代。正式条目不参与普通 breath/dream，SessionStart 时自动附最近 3 条。"""
     return await _with_notice(

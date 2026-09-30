@@ -4,12 +4,12 @@ tools/plan/core.py — plan / letter_write / letter_read 实现
 ========================================
 
 plan 桶记录我答应过、答应自己或想完成的事；letter 桶是她/他与 OB
-之间的长信件。它们都是独立类型，永久保存、不衰减、不出现在普通
-breath 中。
+之间的长信件。它们都是独立类型，永久保存、不衰减。plan 可按时间窗
+经关联记忆随附浮现；letter 不出现在普通 breath 中。
 
 关键行为：
 - plan_create：去重（同正文 + status=active 已存在 → 直接返回原 ID），
-  写入 type=plan + status + weight + 时间窗 + change_log 起点
+  写入 type=plan + status + weight + cue + 时间窗 + change_log 起点
 - letter_write：原文永久保存，author 接受任意字符串署名（"ai" 或等于
   ai_name 时统一存为 ai_name 的值，其它字符串原样存为署名；"user" 为
   用户侧），写入 type=letter + author/title/letter_date 元数据
@@ -26,8 +26,7 @@ breath 中。
 
 import json
 import math
-import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from .. import _runtime as rt
@@ -36,8 +35,16 @@ from .._common import (
     check_metadata_size,
     check_query_size,
 )
-from utils import strip_wikilinks, get_ai_name, get_owner_name, get_tzinfo, get_timezone_name
+from utils import (
+    get_ai_name,
+    get_owner_name,
+    get_timezone_name,
+    get_tzinfo,
+    parse_bool,
+    strip_wikilinks,
+)
 from errors import ToolInputError, safe_error_detail
+from ombrebrain.storage.situation import normalize_cue
 # 锁语义 3.6.5 下沉到 ombrebrain/storage/letter_lock.py：you / them 的证据闸
 # 也要判「这封信对 AI 开没开」，而 ombrebrain 不能反向 import tools。
 # 这里按原名再导出，所有既有调用点不变。
@@ -56,7 +63,15 @@ _GENERIC_RELATION_NAMES = {
 }
 _HUMAN_AUTHOR_ALIASES = {"user", "human", "human-side"}
 _AI_AUTHOR_ALIASES = {"ai", "ai-side", "claude"}
-_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_date_only(value: str) -> bool:
+    """Return whether ``value`` is any ISO date form accepted by Python."""
+    try:
+        date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def normalize_plan_window(value: object, *, boundary: str) -> str | None:
@@ -71,7 +86,7 @@ def normalize_plan_window(value: object, *, boundary: str) -> str | None:
             f"时间窗「{raw}」看不懂。需要 YYYY-MM-DD 或 ISO 8601，"
             "例如 2026-09-02 或 2026-09-02T09:30:00+08:00。"
         ) from exc
-    if _DATE_ONLY_RE.fullmatch(raw) and boundary == "end":
+    if _is_date_only(raw) and boundary == "end":
         parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         parsed = parsed.replace(tzinfo=get_tzinfo())
@@ -195,6 +210,10 @@ def collect_resurfaced_plans(buckets: list, shown_ids, now: datetime) -> list:
         if meta.get("type") != "plan":
             continue
         if str(meta.get("status") or "").strip().lower() != "active":
+            continue
+        if parse_bool(meta.get("dont_surface"), default=False):
+            continue
+        if parse_bool(meta.get("digested"), default=False):
             continue
         related = str(meta.get("related_bucket") or "").strip()
         if not related or related not in shown:
@@ -353,6 +372,7 @@ async def plan_create(
     why_remembered: Optional[str] = "",
     window_start: Optional[str] = "",
     window_end: Optional[str] = "",
+    cue: Optional[dict] = None,
 ) -> str:
     if status is None:
         status = "active"
@@ -428,6 +448,10 @@ async def plan_create(
     from .._common import append_plan_change_log
     initial_log = append_plan_change_log([], "created", to=status, by="plan")
     update_kwargs = {"status": status, "change_log": initial_log}
+    # 前瞻记忆的线索。plan 不再只在 dream 末尾被列一遍——线索场按 cue 命中时把它摆到那一刻。
+    normalized_cue = normalize_cue(cue)
+    if normalized_cue:
+        update_kwargs["cue"] = normalized_cue
     if related_bucket.strip():
         update_kwargs["related_bucket"] = related_bucket.strip()
     if normalized_start:

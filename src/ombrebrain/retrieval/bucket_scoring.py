@@ -140,3 +140,32 @@ def calc_touch_score(meta: dict) -> float:
     """
     count = float(meta.get("activation_count") or 0)
     return min(count / TOUCH_NORMALIZE_CAP, 1.0)
+
+
+def passes_relevance_gate(
+    *,
+    literal_hit: bool,
+    topic: float,
+    bm25: float,
+    semantic: float | None,
+    topic_threshold: float,
+    bm25_threshold: float,
+    semantic_threshold: float,
+) -> bool:
+    """召回的门——只有相关性维度能开门。
+
+    上游 INTERNALS §3.1 自认的债：七维加权分里 emotion / time / importance / touch
+    回答的是"这条记忆本身怎么样"，却和"它跟查询有关吗"去过同一道门。这里把门单拎
+    出来：字面命中、模糊主题、BM25（要配一点主题重合，单个 token 撞上不算）、语义，
+    四条路任一开门；排序仍用七维加权分（新、重要在那里发挥作用，不在这里）。
+    config.matching.gate_rank_split=false 时不走这里，行为与上游逐字一致。
+    """
+    if literal_hit:
+        return True
+    if topic >= topic_threshold:
+        return True
+    if bm25 >= bm25_threshold and topic >= topic_threshold * 0.5:
+        return True
+    if semantic is not None and semantic >= semantic_threshold:
+        return True
+    return False

@@ -22,7 +22,11 @@ from .models import (
     evidence_digest,
     utc_now,
 )
-from .safety import contains_forbidden_subject, leaks_protected_text
+from .safety import (
+    contains_forbidden_subject,
+    forbidden_subject_fields,
+    leaks_protected_text,
+)
 from .store import YouStore, YouStoreError
 
 
@@ -270,7 +274,15 @@ class YouService:
         if len(content) > 500:
             return None, f"content 有 {len(content)} 字，上限 500 字。"
         if contains_forbidden_subject(content, concept_key, concept_value):
-            return None, "这条落在禁止主题里，写不进去。"
+            # 同 them：点名是哪个字段，否则模型只会反复重写正文。
+            踩线 = forbidden_subject_fields(
+                content=content, concept_key=concept_key, concept_value=concept_value
+            )
+            哪里 = "、".join(踩线) if 踩线 else "这几个字段合起来"
+            return None, (
+                f"这条落在禁止主题里，踩线的是 **{哪里}**（不是整条都不行）。"
+                "只改点名的那个字段再试；正文没被点名就说明正文本身没问题。"
+            )
         if leaks_protected_text(content, protected_texts):
             return None, "这条照抄了依据桶的原文；请写成你自己的判断，不要复述原文。"
 
@@ -563,6 +575,7 @@ class YouService:
         aspect: str = "",
         max_results: int = _MAX_HINT_RESULTS,
         with_ids: bool = False,
+        with_pending: bool = True,
     ) -> str:
         state = self.status()
         if not state.enabled or state.scope is None:
@@ -608,16 +621,76 @@ class YouService:
         lines = ["[你自己写下的、关于对方的长期认识；不是此刻的事实，按需自行判断]"]
         if with_ids:
             lines.append("[带 id 是为了撤回：You(delete_id=\"...\")]")
+        正文条数 = 0
         for claim in candidates:
             if contains_forbidden_subject(claim.content):
                 continue
             next_line = "- " + claim.content
             if with_ids:
                 next_line += f"  [id={claim.id}]"
+            # 单条放不下只跳过这一条，不连累后面放得下的（同 #114 breath 侧）。
             if count_tokens_approx("\n".join([*lines, next_line])) > _MAX_HINT_TOKENS:
-                break
+                continue
             lines.append(next_line)
-        return "\n".join(lines) if len(lines) > 1 else ""
+            正文条数 += 1
+        # 按正文条数判空：with_ids 时头部本身就是两行，不能拿行数判断。
+        正文 = "\n".join(lines) if 正文条数 else ""
+        # 带了 query 就不附欠账。`recall(query="Lin")` 问的是「我对 Lin 了解
+        # 什么」，拿一条还没算数的候选去回答它，正是三日门槛要防的事——标了
+        # 「还没算数」也不行，那是答非所问。
+        #
+        # 接力用的是不带 query 的裸读 You()：那一问是「我手上在攒什么」，
+        # 欠账清单正是它的答案。两个用途不冲突，各走各的。
+        if not with_pending or query or aspect:
+            return 正文
+        欠账 = self._pending_digest(state.scope)
+        if not 欠账:
+            return 正文
+        return (正文 + "\n\n" + 欠账) if 正文 else 欠账
+
+    def _pending_digest(self, scope: Scope) -> str:
+        """把还在攒的候选列出来，附上重申需要的那两个键。
+
+        ## 没有这一段，三日门槛走不完
+
+        候选不进召回——那是对的，还没算数的东西不该被当认识用。但它同时意味着
+        **写完就失联**：重申要求「同一个 concept_key + concept_value 再写一次」，
+        而那两个字符串只存在于写它的那次对话里。换窗之后我不记得自己填过什么，
+        于是那条候选永远停在原地，门槛不是「难通过」，是「无法通过」。
+
+        them 早就有这一段（`them/service.py` 的同名方法），You 一直没有——
+        上游反馈里 You 的抱怨比 them 尖锐，原因就在这。
+
+        列的不是认识，是**欠账清单**：明写还没算数、还差几天，并给出重申要用
+        的键。放在已生效内容之后、空行隔开——看得见自己写过什么，不等于可以
+        把它当成已经成立的判断。
+
+        不占 `_MAX_HINT_TOKENS`：那个预算是给召回正文的，欠账挤掉正文就本末
+        倒置了。它只在显式调 You() 时出现，被动浮现拿不到（`with_pending`）。
+        """
+        条目: list[str] = []
+        for claim in self.store.list_claims(scope):
+            if claim.lifecycle != "candidate":
+                continue
+            还差 = max(0, REQUIRED_CONFIRMATIONS - claim.review_date_count)
+            # 依据桶一并给出：重申要带 bucket_ids，而「上次绑的是哪两个桶」
+            # 同样只存在于写它的那次对话里。少了它，换窗的模型还得重新去找
+            # 活跃桶——那正是上游反馈里列的第三个障碍。
+            依据 = "、".join(edge.bucket_id for edge in claim.evidence)
+            条目.append(
+                f"- {claim.concept_key}={claim.concept_value}｜{claim.aspect}\n"
+                f"  「{claim.content}」还差 {还差} 个不同的日子\n"
+                f"  bucket_ids={依据}\n"
+                f"  id={claim.id}"
+            )
+        if not 条目:
+            return ""
+        return (
+            "[下面这些还没算数，是你自己在攒的。想让哪条立住，就用同一个 "
+            "concept_key + concept_value 再写一次；改主意了就别再确认，"
+            "它不会自己生效——也可以用 delete_id=<id> 现在就撤掉。]\n"
+            + "\n".join(条目)
+        )
 
     async def _drop_unsupported(self, claims: list[YouClaim]) -> list[YouClaim]:
         """依据已经塌掉的，当场失效并从这次返回里拿掉。
