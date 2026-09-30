@@ -39,8 +39,41 @@ def _is_reparse_point(info: os.stat_result) -> bool:
     )
 
 
-def _safe_rollback_member(name: str) -> tuple[str, ...]:
-    """把本地备份里的一个成员名规整成路径分段；凡是会在某个文件系统上变成别名的一律拒绝。"""
+def _windows_name_rules() -> bool:
+    """当前平台是否按 Windows 的文件名规则还原（设备名、冒号、结尾空格或点都会变成别名）。
+
+    单独成函数是为了测试能切换平台语义。
+    """
+    return os.name == "nt"
+
+
+def _case_insensitive_root(root: str) -> bool:
+    """恢复根目录所在文件系统是否不分大小写（Windows 恒为真，其他平台按根目录名探测）。
+
+    探测不出来（根目录名里没有字母、换了大小写的路径读不到）就当分大小写：
+    主要部署在 Linux，备份又是在同一个文件系统上走出来的，那里不会有只差大小写的两份。
+    """
+    if _windows_name_rules():
+        return True
+    root_abs = os.path.realpath(root)
+    head, base = os.path.split(root_abs)
+    swapped = base.swapcase()
+    if not base or swapped == base:
+        return False
+    try:
+        return os.path.samefile(root_abs, os.path.join(head, swapped))
+    except OSError:
+        return False
+
+
+def _safe_rollback_member(name: str, *, windows_rules: bool) -> tuple[str, ...]:
+    """把本地备份里的一个成员名规整成路径分段。
+
+    越界（空名、NUL、绝对路径、. 和 ..）在所有平台都拒绝；设备名、冒号、
+    结尾空格或点只在 Windows 上会变成别名，只在 windows_rules 为真时拒绝——
+    Linux 上用户建的域可以叫 aux，sanitize_name 截断后目录名结尾也可能是空格，
+    那些都是合法名字，不能让它们一票否决整包还原。
+    """
 
     raw = str(name or "")
     if not raw or "\x00" in raw:
@@ -51,13 +84,15 @@ def _safe_rollback_member(name: str) -> tuple[str, ...]:
     parts = PurePosixPath(normalized).parts
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("路径越界")
+    if not windows_rules:
+        return tuple(parts)
     reserved = {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
     reserved.update({f"COM{i}" for i in range(1, 10)})
     reserved.update({f"LPT{i}" for i in range(1, 10)})
     for part in parts:
         if ":" in part or part.endswith((" ", ".")):
             raise ValueError("非便携路径")
-        if part.split(".", 1)[0].upper() in reserved:
+        if part.split(".", 1)[0].rstrip(" ").upper() in reserved:
             raise ValueError("Windows 设备名")
     return tuple(parts)
 
@@ -202,12 +237,23 @@ def _rollback_from_backup(buckets_dir: str, backup_zip: str) -> dict:
             # 不会让前面已经通过的成员先部分落盘。
             planned: list[tuple[zipfile.ZipInfo, tuple[str, ...]]] = []
             seen: set[str] = set()
+            windows_rules = _windows_name_rules()
+            # 只差大小写的两个成员，只在不分大小写的文件系统上才会落到同一个文件；
+            # Linux 上它们是两份不同的记忆，都要还原。
+            fold_case = _case_insensitive_root(buckets_dir)
+
+            def _key(parts: tuple[str, ...]) -> str:
+                joined = "/".join(parts)
+                return joined.casefold() if fold_case else joined
+
             for info in z.infolist():
                 if info.is_dir() or info.filename.endswith("/"):
                     continue
                 try:
-                    parts = _safe_rollback_member(info.filename)
-                    key = "/".join(parts).casefold()
+                    parts = _safe_rollback_member(
+                        info.filename, windows_rules=windows_rules
+                    )
+                    key = _key(parts)
                     if key in seen:
                         raise ValueError("重复或大小写冲突路径")
                     seen.add(key)
@@ -232,7 +278,7 @@ def _rollback_from_backup(buckets_dir: str, backup_zip: str) -> dict:
             # 在建任何父目录之前就整包拒绝。
             for _info, parts in planned:
                 for index in range(1, len(parts)):
-                    if "/".join(parts[:index]).casefold() in seen:
+                    if _key(parts[:index]) in seen:
                         失败.append(
                             f"{_info.filename}: 文件/目录前缀冲突"
                         )
