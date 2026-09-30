@@ -401,6 +401,14 @@ async def test_stateless_get_mcp_returns_405_instead_of_idle_sse_stream(
             assert payload["jsonrpc"] == "2.0"
             assert payload["error"]["code"] == -32600
 
+            for accept in (None, "*/*", "application/json"):
+                headers = {} if accept is None else {"accept": accept}
+                plain = await asyncio.wait_for(
+                    client.get("/mcp", headers=headers), 5
+                )
+                assert plain.status_code == 405, accept
+                assert "POST" in plain.headers["allow"]
+
             initialize = await client.post(
                 "/mcp",
                 headers={
