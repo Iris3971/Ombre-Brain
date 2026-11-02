@@ -462,6 +462,44 @@ async def test_failed_chunk_retry_does_not_double_count_failure(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_resume_keeps_failure_state_consistent_when_later_chunk_fails(
+    tmp_path, monkeypatch
+):
+    engine = ImportEngine(
+        {"buckets_dir": str(tmp_path), "human": "用户"},
+        FakeBucketManager(),
+        FakeDehydrator(),
+    )
+    engine._chunks = [
+        {"content": "chunk-0"},
+        {"content": "chunk-1"},
+        {"content": "chunk-2"},
+    ]
+    engine.state.reset("history.txt", "hash", 3, job_id="job")
+    engine.state.data.update({
+        "processed": 1,
+        "chunks_failed": 1,
+        "failed_chunk_indices": [0],
+        "status": "paused",
+    })
+    calls: list[str] = []
+
+    async def process(chunk, _preserve_raw):
+        calls.append(chunk["content"])
+        return chunk["content"] != "chunk-1"
+
+    monkeypatch.setattr(engine, "_process_single_chunk", process)
+
+    result = await engine._process_chunks(False)
+
+    assert calls == ["chunk-0", "chunk-1", "chunk-2"]
+    assert result["processed"] == 3
+    assert result["chunks_failed"] == 1
+    assert result["failed_chunk_indices"] == [1]
+    assert result["status"] == "partial"
+
+
+@pytest.mark.asyncio
 async def test_import_preflight_failure_replaces_stale_status(tmp_path):
     dehydrator = FakeDehydrator()
     dehydrator.api_available = False
