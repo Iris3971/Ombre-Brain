@@ -1,4 +1,4 @@
-"""import_memory.py 回归测试 —— 找茬会话（2026-07-15）发现的四个问题。
+"""import_memory.py 回归测试 —— 覆盖历史导入的断点续传、分块与持久化边界。
 
 1. preserve_raw 断点续传重复导入：进度只在整个 chunk 处理完才落盘，崩溃
    重启后同一个 chunk 会被重新提取一遍；preserve_raw 分支原来完全跳过去重。
@@ -7,6 +7,7 @@
 3. 单次提取正文被固定按 12000 字符截断，远小于 chunk 自身 ~10000 token
    的目标预算（对英文/混合内容而言），且不留任何痕迹。
 4. ImportState.save() 无 fsync/长路径前缀（见 utils.atomic_write_text 用法）。
+5. #137：失败 chunk 推进 processed 后，Resume 不能静默跳过未完成工作。
 """
 import hashlib
 import json
